@@ -657,6 +657,15 @@ func update_uniforms():
 		m.set_shader_param("use_art_mask", 1.0 if mask_tex != null else 0.0)
 		m.set_shader_param("mask_channel", g["slot"] % height_field.SLOTS_PER_CHAIN)
 
+		# Shadow blockers ("Stops outside shadows"): the march ends where a
+		# sun-ray crosses one. Same texture for every pass, or the telescoping
+		# subtraction would disagree between layers about what exists.
+		var blocker_tex = height_field.get_blocker_texture()
+		if blocker_tex != null:
+			blocker_tex.flags = Texture.FLAG_FILTER
+		m.set_shader_param("blocker_tex", blocker_tex if blocker_tex != null else tex_a)
+		m.set_shader_param("use_blocker", 1.0 if blocker_tex != null else 0.0)
+
 	# Re-run the bakes with the new parameters. Without this the visible sprites
 	# keep showing the previous march.
 	_thaw_bake()

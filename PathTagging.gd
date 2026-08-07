@@ -27,7 +27,7 @@ var shadow_renderer = null
 # Config keys that change the shape of the elevation field (or the art mask
 # rasterised alongside it), so the field pass has to be re-run rather than just
 # the shader uniforms updated.
-const FIELD_KEYS = ["enabled", "side", "height", "art_above", "mask_inset"]
+const FIELD_KEYS = ["enabled", "side", "height", "art_above", "mask_inset", "blocks"]
 
 const CASTER_DEFAULTS = {
 	"enabled": false,
@@ -58,6 +58,16 @@ const CASTER_DEFAULTS = {
 	# Default 5: the user tuned this on their real cliff assets (2026-08-07) —
 	# it covers the mask's bilinear smear plus typical soft texture fringes.
 	"mask_inset": 5.0,
+	# "Stops outside shadows": the path/wall's strip becomes a shadow BLOCKER —
+	# the march stops when a sun-ray crosses it, so shadows cast by anything
+	# BEYOND it (mountains, cliffs) never reach the near side. Deliberately
+	# non-physical: a mountain's shadow really would cover a house's interior
+	# (it covers the roof), but battlemaps show the floor plan, and the floor
+	# plan should be lit. Independent of "enabled" — a wall can block without
+	# casting, cast without blocking, or both. Open portals pass through the
+	# blocker too (same strip, same gap cutting), so an open door lets an
+	# outside cliff's shadow spill into the room, which is the cool part.
+	"blocks": false,
 	# REMOVED: "padding" (ShadowBuilder-era shadow start offset). Old stored
 	# values merge into the config dict harmlessly; nothing reads them.
 }
@@ -92,6 +102,27 @@ func _get_portal_store() -> Dictionary:
 	if not global.ModMapData.has(core.PORTAL_KEY):
 		global.ModMapData[core.PORTAL_KEY] = {}
 	return global.ModMapData[core.PORTAL_KEY]
+
+# Every path/wall flagged "Stops outside shadows", on the current level and
+# visible. Independent of the caster flag.
+func get_blocker_nodes() -> Array:
+	var result = []
+	var store = _get_store()
+	var level = global.World.GetCurrentLevel()
+	for nid in store.keys():
+		if not store[nid].get("blocks", false):
+			continue
+		if not global.World.HasNodeID(nid):
+			continue
+		var node = global.World.GetNodeByID(nid)
+		if node == null or not is_instance_valid(node):
+			continue
+		if level != null and not _is_descendant_of(node, level):
+			continue
+		if node.has_method("is_visible_in_tree") and not node.is_visible_in_tree():
+			continue
+		result.append(node)
+	return result
 
 # A wall's portals. NOT via wall.get("Portals"): that C# property is a
 # System.Collections.Generic.List<Portal>, which Godot's bridge cannot marshal
@@ -137,16 +168,23 @@ func is_portal_open(portal) -> bool:
 	return false
 
 func get_config(node) -> Dictionary:
+	var cfg = CASTER_DEFAULTS.duplicate()
+	var entry = null
 	var nid = core.get_node_id(node)
-	if nid == null:
-		return CASTER_DEFAULTS.duplicate()
-	var store = _get_store()
-	if store.has(nid):
-		var cfg = CASTER_DEFAULTS.duplicate()
-		for key in store[nid].keys():
-			cfg[key] = store[nid][key]
-		return cfg
-	return CASTER_DEFAULTS.duplicate()
+	if nid != null:
+		var store = _get_store()
+		if store.has(nid):
+			entry = store[nid]
+			for key in entry.keys():
+				cfg[key] = entry[key]
+	# A DD WALL is free-standing by nature, so its side defaults to
+	# "Wall (both)" — the user's wall silently filling 109% of the map as a
+	# Side-A contour (and its door portals cutting nothing, since gaps only
+	# apply to the strip) is exactly the failure this prevents. Only an
+	# explicit user choice overrides it.
+	if (entry == null or not entry.has("side")) and node.get("Joint") != null:
+		cfg["side"] = 2
+	return cfg
 
 func set_config_value(node, key: String, value):
 	var nid = core.get_node_id(node)
@@ -155,7 +193,11 @@ func set_config_value(node, key: String, value):
 		return
 	var store = _get_store()
 	if not store.has(nid):
-		store[nid] = CASTER_DEFAULTS.duplicate()
+		# ONLY the changed key. Seeding the full defaults dict here froze
+		# "whatever the defaults were on the day this path was first touched"
+		# as explicit choices, which breaks computed defaults (a wall's side,
+		# art_above's null) and default changes alike.
+		store[nid] = {}
 	store[nid][key] = value
 	outputlog("path %s: %s = %s" % [nid, key, str(value)], 1)
 	# Every per-path setting changes the elevation field, so the field (and the
@@ -248,7 +290,8 @@ func caster_fingerprint() -> int:
 	var h = 0
 	var store = _get_store()
 	for nid in store.keys():
-		if not store[nid].get("enabled", false):
+		# Casters AND blockers both shape the field pass.
+		if not (store[nid].get("enabled", false) or store[nid].get("blocks", false)):
 			continue
 		h = int(h * 31 + str(nid).hash()) % 0x7FFFFFFF
 		if not global.World.HasNodeID(nid):
@@ -514,6 +557,21 @@ func _build_select_tool_ui():
 	container.add_child(art_row)
 	st_ui["art_above"] = art_toggle
 
+	var blocks_row = HBoxContainer.new()
+	var blocks_label = Label.new()
+	blocks_label.text = "Stops outside shadows"
+	blocks_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	blocks_label.hint_tooltip = ("Shadows cast by anything beyond this wall stop at it —\n" +
+		"a house between cliffs keeps its floor plan lit. Open doors\n" +
+		"and windows still let outside shadows spill through.\n" +
+		"Independent of casting: a wall can block, cast, or both.")
+	blocks_row.add_child(blocks_label)
+	var blocks_toggle = CheckButton.new()
+	blocks_toggle.connect("toggled", self, "_on_st_blocks_toggled")
+	blocks_row.add_child(blocks_toggle)
+	container.add_child(blocks_row)
+	st_ui["blocks"] = blocks_toggle
+
 	var inset_row = HBoxContainer.new()
 	var inset_label = Label.new()
 	inset_label.text = "Shadow inset"
@@ -625,6 +683,8 @@ func on_selection_changed():
 	st_ui["height_spin"].value = h_ft
 	if st_ui.has("art_above"):
 		st_ui["art_above"].pressed = get_art_above(path)
+	if st_ui.has("blocks"):
+		st_ui["blocks"].pressed = cfg.get("blocks", false)
 	if st_ui.has("inset_slider"):
 		st_ui["inset_slider"].value = cfg.get("mask_inset", 5.0)
 		st_ui["inset_spin"].value = cfg.get("mask_inset", 5.0)
@@ -688,6 +748,11 @@ func _on_st_art_above_toggled(pressed):
 	if _syncing or _current_path == null:
 		return
 	set_config_value(_current_path, "art_above", pressed)
+
+func _on_st_blocks_toggled(pressed):
+	if _syncing or _current_path == null:
+		return
+	set_config_value(_current_path, "blocks", pressed)
 
 func _on_st_portal_open_toggled(pressed):
 	if _syncing or _current_portal == null:

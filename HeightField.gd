@@ -96,6 +96,11 @@ var _chains = []
 # = the chain's three slots). No blur — the mask must follow the art's alpha
 # edge exactly. [{"vp":Viewport, "root":Node2D}]
 var _mask_chains = []
+# The SHADOW BLOCKER raster: strips of every "Stops outside shadows" path/
+# wall, rendered white into one binary target (field size, no blur). The march
+# stops when a sun-ray crosses it, so occluders beyond never darken the near
+# side. {"vp":Viewport, "root":Node2D} or null.
+var _blocker = null
 var _smooth_shader = null
 var _mask_shader = null
 var _debug_sprites = []
@@ -165,6 +170,9 @@ func _compute_raster_rect() -> Rect2:
 	var tier_px = float(sun_settings.get_sun().get("tier_px", 256.0))
 	for path in path_tagging.get_caster_nodes():
 		for p in _world_points(path):
+			rect = rect.expand(p)
+	for node in path_tagging.get_blocker_nodes():
+		for p in _world_points(node):
 			rect = rect.expand(p)
 	# Cap expansion at two tiers beyond the canvas on every side.
 	rect = rect.clip(_map_rect.grow(tier_px * 2.0))
@@ -891,6 +899,7 @@ func rebuild():
 
 	_build_smooth_passes(vp_size)
 	_build_art_masks(vp_size)
+	_build_blockers(vp_size)
 
 	_viewport_count = 0
 	for chain in _chains:
@@ -1283,6 +1292,38 @@ func _build_art_masks(vp_size: Vector2):
 		outputlog("art mask built: %d path(s) across %d layer(s), %d mask target(s)" % [
 			copied, matched, _mask_chain_count()], 0)
 
+# SHADOW BLOCKERS ("Stops outside shadows"). Rasterises each flagged path/
+# wall's strip — full width, open portals cut out, same geometry the wall mode
+# uses — as solid white into one binary field-sized target. The march samples
+# it each step and stops on crossing, so shadow sources beyond a blocker never
+# reach the near side (the house between cliffs keeps its floor lit), while
+# open doors let the outside shadow spill through the gap. Non-physical by
+# design; see the `blocks` config comment in PathTagging.
+func _build_blockers(vp_size: Vector2):
+	var nodes = path_tagging.get_blocker_nodes()
+	if nodes.size() == 0:
+		return
+	_blocker = _make_mask_chain(vp_size)
+	var drawn = 0
+	for node in nodes:
+		# Full width (inset 0): a blocker should stop shadows at the wall's
+		# footprint, and a slightly generous edge also guards against the
+		# march's growing stride stepping over a thin strip.
+		for poly in _path_strip_polygons(node, 0.0):
+			var mesh = _make_polygon_mesh(poly, Color(1, 1, 1, 1))
+			if mesh == null:
+				continue
+			var mi = MeshInstance2D.new()
+			mi.mesh = mesh
+			_blocker["root"].add_child(mi)
+			drawn += 1
+	outputlog("shadow blockers: %d node(s) -> %d strip piece(s)" % [nodes.size(), drawn], 0)
+
+func get_blocker_texture():
+	if _blocker == null or _blocker["vp"] == null or not is_instance_valid(_blocker["vp"]):
+		return null
+	return _blocker["vp"].get_texture()
+
 # The Line2D nodes that carry a caster's visible artwork: the node itself for
 # paths, its direct Line2D children for walls (DD builds those per segment,
 # with portal gaps already cut).
@@ -1348,6 +1389,8 @@ func _all_viewports() -> Array:
 	for mc in _mask_chains:
 		if mc != null and mc["vp"] != null and is_instance_valid(mc["vp"]):
 			out.append(mc["vp"])
+	if _blocker != null and _blocker["vp"] != null and is_instance_valid(_blocker["vp"]):
+		out.append(_blocker["vp"])
 	return out
 
 func get_raster_rect():
@@ -1396,8 +1439,13 @@ func _teardown_viewport():
 			if mc["vp"].get_parent() != null:
 				mc["vp"].get_parent().remove_child(mc["vp"])
 			mc["vp"].queue_free()
+	if _blocker != null and _blocker["vp"] != null and is_instance_valid(_blocker["vp"]):
+		if _blocker["vp"].get_parent() != null:
+			_blocker["vp"].get_parent().remove_child(_blocker["vp"])
+		_blocker["vp"].queue_free()
 	_chains = []
 	_mask_chains = []
+	_blocker = null
 	_groups = []
 	_viewport_count = 0
 

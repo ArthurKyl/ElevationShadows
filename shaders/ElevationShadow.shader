@@ -86,6 +86,15 @@ uniform sampler2D art_mask;
 uniform float use_art_mask = 0.0;
 uniform int mask_channel = 0;
 
+// Shadow BLOCKER raster ("Stops outside shadows" strips, binary, unblurred).
+// When a march step lands on it, the march ends: occluders beyond the blocker
+// never darken this pixel. Deliberately non-physical — a mountain's shadow
+// really would cover a house's interior, but the battlemap shows the floor
+// plan and the floor plan should stay lit. Open portals are already cut out
+// of the strip, so doorways let outside shadows spill through.
+uniform sampler2D blocker_tex;
+uniform float use_blocker = 0.0;
+
 const int MAX_STEPS = 512;
 
 // The sampler MUST be passed in. Godot's shader language only exposes built-ins
@@ -226,6 +235,15 @@ void fragment() {
 					}
 				}
 			}
+		}
+
+		// Blocker check AFTER this step's occlusion: elevation rising at the
+		// blocker's own strip (a wall that both casts and blocks) still shades
+		// the near side, but nothing beyond the strip does. The blocker raster
+		// is unblurred and FILTER-sampled, so the 0.3 threshold triggers a bit
+		// outside the exact strip edge — erring towards blocking.
+		if (use_blocker > 0.5 && texture(blocker_tex, uv_s).r > 0.3) {
+			break;
 		}
 	}
 
