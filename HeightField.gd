@@ -301,11 +301,55 @@ func _path_strip_polygons(path, inset: float) -> Array:
 						next_pieces.append(cut)
 		solids = next_pieces
 
+	solids = _cut_open_portals(path, solids, half)
+
 	if solids.size() == 0:
 		outputlog("path %s: wall strip produced no fillable region" % str(core.get_node_id(path)), 0)
 	elif holes.size() > 0:
 		outputlog("path %s: wall ring with %d enclosed region(s) -> %d simple piece(s)" % [
 			str(core.get_node_id(path)), holes.size(), solids.size()], 1)
+	return solids
+
+# Sun through open doors. A DD portal carries the map's own open/shut state:
+# Portal.Closed is the portal-tool toggle DD's lighting system reads (saved as
+# 'closed', drives the portal's LightOccluder). So the elevation honours the
+# same truth — an OPEN portal cuts its span out of the wall's raised strip and
+# the shadow breaks exactly where light would pass; a closed one leaves the
+# wall solid. Portal.Begin/End are world-space endpoints of the portal along
+# the wall (global_position ± direction * radius, verified in the assembly).
+# The cut rectangle overhangs the strip on both sides, so it always bisects a
+# piece rather than punching a hole (which could not be triangulated).
+func _cut_open_portals(path, solids: Array, half: float) -> Array:
+	var portals = path.get("Portals")
+	if portals == null:
+		return solids
+	var cut = 0
+	for portal in portals:
+		if portal == null or not is_instance_valid(portal):
+			continue
+		var closed = portal.get("Closed")
+		if closed == null or bool(closed):
+			continue
+		var a = portal.get("Begin")
+		var b = portal.get("End")
+		if not (a is Vector2 and b is Vector2):
+			continue
+		var d = b - a
+		if d.length() < 0.5:
+			continue
+		var dirn = d.normalized()
+		var n = Vector2(-dirn.y, dirn.x) * (half + 32.0)
+		var gap = PoolVector2Array([a - n, b - n, b + n, a + n])
+		var next = []
+		for piece in solids:
+			for c in Geometry.clip_polygons_2d(_to_packed(piece), gap):
+				if c.size() >= 3 and not Geometry.is_polygon_clockwise(c):
+					next.append(c)
+		solids = next
+		cut += 1
+	if cut > 0:
+		outputlog("path %s: %d open portal(s) let light through the wall strip" % [
+			str(core.get_node_id(path)), cut], 1)
 	return solids
 
 # The polygon's parts left and right of the vertical line at cx.

@@ -216,6 +216,16 @@ func caster_fingerprint() -> int:
 			for p in pts:
 				checksum += p.x * 0.13 + p.y * 0.71
 			h = int(h * 31 + pts.size() * 131 + int(checksum)) % 0x7FFFFFFF
+		# Walls: doors opening/closing (and portals added/moved) change where
+		# light passes through the strip, so they must re-rasterise too.
+		var portals = node.get("Portals")
+		if portals != null:
+			for portal in portals:
+				if portal == null or not is_instance_valid(portal):
+					continue
+				var closed = portal.get("Closed")
+				h = int(h * 31 + (3 if (closed != null and bool(closed)) else 7)) % 0x7FFFFFFF
+				h = int(h * 31 + int(portal.global_position.x * 0.53 + portal.global_position.y * 0.29)) % 0x7FFFFFFF
 	return h
 
 # Effective "Art above shadow" for a path: the stored value if the user set it,
