@@ -320,9 +320,9 @@ func _path_strip_polygons(path, inset: float) -> Array:
 # The cut rectangle overhangs the strip on both sides, so it always bisects a
 # piece rather than punching a hole (which could not be triangulated).
 func _cut_open_portals(path, solids: Array, half: float) -> Array:
-	var portals = path.get("Portals")
-	if portals == null:
-		return solids
+	# Via PathTagging.get_wall_portals — Wall.Portals itself is a C# List<T>
+	# that Godot's bridge cannot marshal (get() returns null, silently).
+	var portals = path_tagging.get_wall_portals(path)
 	var cut = 0
 	for portal in portals:
 		if portal == null or not is_instance_valid(portal):

@@ -93,6 +93,33 @@ func _get_portal_store() -> Dictionary:
 		global.ModMapData[core.PORTAL_KEY] = {}
 	return global.ModMapData[core.PORTAL_KEY]
 
+# A wall's portals. NOT via wall.get("Portals"): that C# property is a
+# System.Collections.Generic.List<Portal>, which Godot's bridge cannot marshal
+# to a Variant — get() silently returns null (the bug: no doorway gap was ever
+# cut, while the toggles "worked" because they only write the store). Portals
+# are nodes in the level's Portals container referencing their wall by WallID
+# (int32); resolving WallID through DD's own GetNodeByID and comparing node
+# identity sidesteps every id-format question.
+func get_wall_portals(wall) -> Array:
+	var out = []
+	var level = global.World.GetCurrentLevel()
+	if level == null:
+		return out
+	var container = level.get("Portals")
+	if container == null:
+		return out
+	for child in container.get_children():
+		if child == null or not is_instance_valid(child):
+			continue
+		var wid = child.get("WallID")
+		if wid == null:
+			continue
+		if not global.World.HasNodeID(wid):
+			continue
+		if global.World.GetNodeByID(wid) == wall:
+			out.append(child)
+	return out
+
 # Does sunlight pass through this portal? The mod's own per-portal toggle wins;
 # otherwise DD's Portal.Closed decides (its default is false = open — and this
 # DD build exposes no UI for it, which is why the mod has its own toggle).
@@ -244,9 +271,8 @@ func caster_fingerprint() -> int:
 		# Walls: doors opening/closing (and portals added/moved) change where
 		# light passes through the strip, so they must re-rasterise too. Uses
 		# the EFFECTIVE state (mod override, else DD's Closed flag).
-		var portals = node.get("Portals")
-		if portals != null:
-			for portal in portals:
+		if node.get("Joint") != null:
+			for portal in get_wall_portals(node):
 				if portal == null or not is_instance_valid(portal):
 					continue
 				# STAMP new portals with the PortalTool panel's default. DD has
