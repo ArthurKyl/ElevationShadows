@@ -787,10 +787,6 @@ func get_chain_count() -> int:
 func get_viewport_count() -> int:
 	return _viewport_count
 
-# Tallest stacked elevation measured in the field, or 0.0 if it has not been read
-# back yet. ShadowRenderer uses it to tighten the march's early-exit bound.
-func get_max_height_tiers() -> float:
-	return _observed_max_tiers
 
 #########################################################################################################
 ## RASTERISE
@@ -1035,16 +1031,17 @@ func _log_histogram():
 			gi, int(_groups[gi]["layer"]), 100.0 * slot_hits[gi] / max(1, samples)])
 	outputlog("per-layer field coverage: %s" % cov.join(" | "), 0)
 
-	var prev = _observed_max_tiers
 	_observed_max_tiers = observed
-	outputlog("max stacked elevation measured: %.2f tiers (previous bound %.2f)" % [observed, prev], 0)
+	# INFORMATIVE ONLY. This number used to cap the march's stack bound and
+	# trigger re-bakes — deleted 2026-08-07: the sparse grid misses thin wall
+	# strips, so the cap truncated their shadows, and because the value was
+	# cached across rebuilds the truncation came and went with rebuild order
+	# (the user watched a wall's shadow jump between 2-3 squares and full
+	# length just by toggling an unrelated portal setting). The march now uses
+	# the analytic bound only.
+	outputlog("max stacked elevation measured: %.2f tiers (sparse grid, informative only)" % observed, 0)
 
 	_log_mask_probe(imgs)
-	# A tighter bound shortens every march, which matters a lot now that a
-	# per-layer pass cannot always exit on its own running maximum. Re-bake once,
-	# through Core, if the number moved enough to be worth it.
-	if abs(observed - prev) > 0.5 and core != null and core.has_method("on_height_field_measured"):
-		core.on_height_field_measured()
 
 # MASK/FIELD ALIGNMENT PROBE. Diagnoses "the shadow starts N px away from the
 # art" without eyeballing: for the first slot with mask coverage, find the row

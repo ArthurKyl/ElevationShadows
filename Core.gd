@@ -260,19 +260,9 @@ func build_all():
 	if shadow_renderer != null:
 		shadow_renderer.rebuild()
 
-# HeightField reads the finished raster back a frame after each rebuild and
-# measures the tallest stack actually present. That number bounds the march's
-# early exit, and the analytic bound it replaces (every caster's drop summed) can
-# be several times too large — which now costs real time, because a per-layer pass
-# has to keep marching until it can rule out a higher layer's occluder. Called
-# only when the measurement moved enough to matter, so this is one extra bake per
-# rebuild at most.
-func on_height_field_measured():
-	if shadow_renderer == null:
-		return
-	if get_mode() == MODE_OFF:
-		return
-	shadow_renderer.update_uniforms()
+# (on_height_field_measured was deleted 2026-08-07 with the measured march
+# bound: the sparse readback missed thin wall strips and its cached value made
+# shadow lengths depend on rebuild order. The march bounds itself analytically.)
 
 var _rebuild_timer = null
 var _want_mesh = false

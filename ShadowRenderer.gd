@@ -885,24 +885,23 @@ func _solve_growth(base: float, target: float, steps: int) -> float:
 			hi = mid
 	return (lo + hi) * 0.5
 
-# Bound on the tallest stacked elevation. Two sources:
+# Bound on the tallest stacked elevation: every caster's drop summed. Correct
+# by construction — the additive field can never exceed it — and it feeds
+# `head_room`, which is what lets the march stop early.
 #
-#   * analytic — every caster's drop summed. Always safe, but on a nested map it
-#     overshoots badly (40 contours of 1 tier each never stack 40 deep).
-#   * measured — the maximum actually read back out of the raster, cached in
-#     HeightField across rebuilds.
-#
-# The bound feeds `head_room`, which is what lets the march stop early. That
-# mattered little when one pass could always exit on its own running maximum, but
-# a per-layer pass has to keep marching until it can rule out a HIGHER layer's
-# occluder, so a 5x-too-large bound now costs 5x the steps. Take the smaller of
-# the two, with a tier of margin because the readback is a sparse grid sample.
+# There USED to be a second, tighter source: the maximum measured by reading
+# the raster back. DELETED 2026-08-07, because the readback samples a sparse
+# grid (~21 texels) that steps straight over thin wall strips: a 30 ft wall
+# standing on ~25 ft of stacked terrain was invisible to it, the bound came
+# out ~6 tiers instead of ~11, and for pixels on the elevated ground
+# `head_room = (max_tiers - h0)` hit zero almost immediately — the march gave
+# up ~1200 px out and the wall's shadow truncated to a fraction of its length
+# ("the solid wall becomes way too short"). Diagnosed by the mask probe's
+# dense per-slot field peaks, which showed the strip rasterised at full
+# height while the shadow still cut short. The analytic bound costs extra
+# march steps on nested maps; correctness wins.
 func _max_stack_tiers() -> float:
 	var analytic = 0.0
 	for path in path_tagging.get_caster_nodes():
 		analytic += float(path_tagging.get_config(path).get("height", 1.0))
-	analytic = max(1.0, analytic)
-	var measured = height_field.get_max_height_tiers()
-	if measured >= 1.0:
-		return max(1.0, min(analytic, measured + 1.0))
-	return analytic
+	return max(1.0, analytic)
