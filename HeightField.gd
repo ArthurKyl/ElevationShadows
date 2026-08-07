@@ -330,7 +330,21 @@ func _path_strip_polygons(path, inset: float) -> Array:
 func _cut_open_portals(path, solids: Array, half: float) -> Array:
 	# Via PathTagging.get_wall_portals — Wall.Portals itself is a C# List<T>
 	# that Godot's bridge cannot marshal (get() returns null, silently).
-	var portals = path_tagging.get_wall_portals(path)
+	var portals = path_tagging.get_wall_portals(path, true)
+	# Portals without a living WallID (freestanding, or their wall was
+	# redrawn) are adopted by proximity: DD only writes WallID when the portal
+	# snapped onto the wall at placement, and a door dropped onto the art
+	# without snapping should still make a gap.
+	var pts = _world_points(path)
+	if pts.size() >= 2:
+		for portal in path_tagging.get_unattached_portals():
+			var radius = portal.get("Radius")
+			var reach = half + (float(radius) if radius != null else 64.0)
+			var dist = _dist_to_polyline(pts, portal.global_position)
+			if dist <= reach:
+				portals.append(portal)
+				outputlog("path %s: unattached portal adopted by proximity (%.0f px from wall line)" % [
+					str(core.get_node_id(path)), dist], 0)
 	var cut = 0
 	for portal in portals:
 		if portal == null or not is_instance_valid(portal):
@@ -358,8 +372,21 @@ func _cut_open_portals(path, solids: Array, half: float) -> Array:
 		cut += 1
 	if cut > 0:
 		outputlog("path %s: %d open portal(s) let light through the wall strip" % [
-			str(core.get_node_id(path)), cut], 1)
+			str(core.get_node_id(path)), cut], 0)
+	elif portals.size() > 0:
+		outputlog("path %s: %d portal(s) on this wall, NONE open for sunlight -> no gaps" % [
+			str(core.get_node_id(path)), portals.size()], 0)
 	return solids
+
+# Shortest distance from a point to any segment of a polyline.
+func _dist_to_polyline(pts: PoolVector2Array, p: Vector2) -> float:
+	var best = 1e12
+	for i in range(pts.size() - 1):
+		var closest = Geometry.get_closest_point_to_segment_2d(p, pts[i], pts[i + 1])
+		var d = closest.distance_to(p)
+		if d < best:
+			best = d
+	return best
 
 # The polygon's parts left and right of the vertical line at cx.
 func _split_at_x(poly, cx: float) -> Array:

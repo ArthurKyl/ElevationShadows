@@ -131,7 +131,46 @@ func get_blocker_nodes() -> Array:
 # are nodes in the level's Portals container referencing their wall by WallID
 # (int32); resolving WallID through DD's own GetNodeByID and comparing node
 # identity sidesteps every id-format question.
-func get_wall_portals(wall) -> Array:
+func get_wall_portals(wall, verbose: bool = false) -> Array:
+	var out = []
+	var level = global.World.GetCurrentLevel()
+	if level == null:
+		return out
+	var container = level.get("Portals")
+	if container == null:
+		if verbose:
+			outputlog("portal scan: Level.Portals container not found", 0)
+		return out
+	var seen = 0
+	var report = PoolStringArray()
+	for child in container.get_children():
+		if child == null or not is_instance_valid(child):
+			continue
+		var wid = child.get("WallID")
+		if wid == null:
+			continue
+		seen += 1
+		var owner = null
+		if global.World.HasNodeID(wid):
+			owner = global.World.GetNodeByID(wid)
+		if verbose and report.size() < 8:
+			report.append("wid=%s->%s open=%s" % [
+				str(wid), "THIS WALL" if owner == wall else ("dead" if owner == null else "other"),
+				str(is_portal_open(child))])
+		if owner == wall:
+			out.append(child)
+	if verbose:
+		outputlog("portal scan for wall %s: %d children, %d portal(s), %d attached to this wall | %s" % [
+			str(core.get_node_id(wall)), container.get_child_count(), seen, out.size(),
+			report.join(" ; ")], 0)
+	return out
+
+# Portals not attached to any LIVING wall: freestanding ones, and ones whose
+# WallID points at a deleted/redrawn wall. These get matched to walls by
+# PROXIMITY in the strip cutter — DD only writes a WallID when the portal
+# snapped onto the wall at placement, and a door dropped onto the art without
+# snapping should still make a gap.
+func get_unattached_portals() -> Array:
 	var out = []
 	var level = global.World.GetCurrentLevel()
 	if level == null:
@@ -145,10 +184,9 @@ func get_wall_portals(wall) -> Array:
 		var wid = child.get("WallID")
 		if wid == null:
 			continue
-		if not global.World.HasNodeID(wid):
+		if global.World.HasNodeID(wid) and global.World.GetNodeByID(wid) != null:
 			continue
-		if global.World.GetNodeByID(wid) == wall:
-			out.append(child)
+		out.append(child)
 	return out
 
 # Does sunlight pass through this portal? The mod's own per-portal toggle wins;
