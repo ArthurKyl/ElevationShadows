@@ -88,6 +88,7 @@ Dungeondraft 1.2.0.1.
 | Sun height | Sun altitude. Low sun = long shadows. The realism note updates live. |
 | Strength | How dark shadows are. |
 | Diffusion | The sun's angular size: edge softness, widening with distance. |
+| Tint | The shadow's colour cast. Black (the default) is neutral; a cool blue-violet reads as daylight, a warm brown as dusk. Hue only — darkness stays with Strength. |
 | Show elevation field | Debug overlay of the computed terrain heights. |
 
 ## How it works (short version)

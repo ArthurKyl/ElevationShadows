@@ -30,6 +30,13 @@ const SUN_DEFAULTS = {
 	"follow_roof_sun": true, # mirror DD's native RoofTool.SunDirection
 	"opacity": 0.55,         # global shadow strength
 	"softness": 0.5,         # how fast the shadow blurs with distance (0 = stays crisp)
+	# The shadow's colour cast, as an html hex STRING ("rrggbb", no alpha).
+	# Stored as a string, not a Color: the sun store rides ModMapData through
+	# DD's map serialization, and a string trivially survives that round-trip
+	# where a Godot Color may not. Alpha is deliberately absent — darkness is
+	# Strength's job (the bake's red channel); the tint is hue only.
+	# Default pure black = exactly the old hard-coded look.
+	"shadow_tint": "000000",
 	# World px of height per elevation tier. Taken from DD's tile size at load, so
 	# one tier = one grid square. Not exposed: it scales shadow length, which is
 	# what Sun height already does, so two controls for it only confuses things.
@@ -71,14 +78,16 @@ const SUN_DEFAULTS = {
 }
 
 # Which settings invalidate what.
-#   UNIFORM_KEYS — the march reads these as shader parameters, so changing them
-#                  is a parameter write. No geometry, no rasterising, instant.
+#   MESH_KEYS    — read as shader parameters (the march's uniforms, or the
+#                  display material's shadow_color for shadow_tint), so
+#                  changing them is a parameter write via update_uniforms().
+#                  No geometry, no rasterising, instant.
 #   FIELD_KEYS   — change the elevation field itself, so it must be re-rasterised
 #                  and the sprite rebuilt.
 # Anything in neither list changes no output and must not trigger a rebuild
 # (debug_height_field only shows/hides the overlay; follow_roof_sun only affects
 # whether azimuth tracks DD's slider).
-const MESH_KEYS = ["azimuth", "altitude", "opacity", "softness", "tier_px"]
+const MESH_KEYS = ["azimuth", "altitude", "opacity", "softness", "shadow_tint", "tier_px"]
 const FIELD_KEYS = ["tier_px", "level_blend"]
 
 var sun = {}
@@ -134,6 +143,19 @@ func get_feet_per_square() -> float:
 func get_length_ratio() -> float:
 	var alt = clamp(float(sun.get("altitude", 35.0)), 1.0, 89.0)
 	return 1.0 / tan(deg2rad(alt))
+
+# The shadow tint as a Color, alpha forced to 1 — the display shader must get
+# RGB only, exactly like the old hard-coded Color(0,0,0,1), or the tint would
+# double up with Strength. The live `sun` dict carries the html STRING (see
+# SUN_DEFAULTS); this is the one place it becomes a Color. Malformed or
+# missing values fall back to pure black, the factory look.
+func get_shadow_tint() -> Color:
+	var s = str(sun.get("shadow_tint", "000000"))
+	if not s.is_valid_html_color():
+		return Color(0, 0, 0, 1)
+	var c = Color(s)
+	c.a = 1.0
+	return c
 
 #########################################################################################################
 ## INIT
@@ -224,6 +246,8 @@ func _build_ui(parent):
 		"How dark a shadow is at its darkest, right at the cliff.")
 	ui["softness"] = _add_slider_row(parent, "Diffusion", "softness", 0.0, 1.0, 0.01,
 		"How blurry the shadow's outer edge is.\nThe blur widens with distance from the cliff, like real penumbra.")
+	ui["shadow_tint"] = _add_color_row(parent, "Tint", "shadow_tint",
+		"The shadow's colour cast. Black is neutral;\ntry a cool blue-violet for daylight or a warm brown for dusk.\nDarkness stays Strength's job — this is hue only.")
 	# No "Length fade" (a real shadow stays equally dark to its end; Diffusion's
 	# penumbra is the physical version of the look) and no "Layer offset" (the
 	# shadow node must sit at EXACTLY z = its layer for Bring to front / Send to
@@ -297,6 +321,46 @@ func _add_slider_row(parent, label_text: String, key: String,
 		label_text, key, str(min_val), str(max_val), str(step_val),
 		str(slider.value), err_s, err_p], 0)
 	return {"slider": slider, "spin": spin}
+
+# Label + ColorPickerButton, one-way bound: the picker writes an html hex
+# STRING into `sun[key]` (see the shadow_tint note in SUN_DEFAULTS for why a
+# string and not a Color). Same single-row layout as _add_slider_row — the
+# panel's height budget allows exactly one extra row here.
+func _add_color_row(parent, label_text: String, key: String, tip: String = "") -> ColorPickerButton:
+	var row = HBoxContainer.new()
+
+	var label = Label.new()
+	label.text = label_text
+	label.rect_min_size = Vector2(104, 0)
+	label.clip_text = true
+	if tip != "":
+		label.hint_tooltip = tip
+	row.add_child(label)
+
+	var picker = ColorPickerButton.new()
+	# No alpha editing: shadow opacity is Strength's job (the bake's red
+	# channel carries it); an alpha here would double up and confuse.
+	picker.edit_alpha = false
+	picker.color = get_shadow_tint()
+	picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	if tip != "":
+		picker.hint_tooltip = tip
+	var err_c = picker.connect("color_changed", self, "_on_tint_changed", [key])
+	row.add_child(picker)
+
+	parent.add_child(row)
+	# Same build-time wiring report as the slider rows: a dead signal must be
+	# diagnosable from the log, not inferred from behaviour.
+	outputlog("row '%s' key=%s init=#%s connect(color)=%d" % [
+		label_text, key, picker.color.to_html(false), err_c], 0)
+	return picker
+
+func _on_tint_changed(color, key):
+	outputlog("tint event key=%s value=#%s syncing=%s" % [key, color.to_html(false), str(_syncing)], 0)
+	if _syncing:
+		return
+	# Store as html string, alpha stripped — serialization-safe and hue-only.
+	_set_value(key, color.to_html(false))
 
 func _on_slider_changed(value, key):
 	# Unconditional entry log: distinguishes "signal never arrived" from
@@ -386,6 +450,11 @@ func _sync_ui_from_state():
 	for flag_key in ["follow_roof_sun", "debug_height_field"]:
 		if ui.has(flag_key) and ui[flag_key] is CheckButton:
 			ui[flag_key].pressed = sun.get(flag_key, true)
+	# The tint picker is neither a slider dict nor a CheckButton — its own branch.
+	# Setting .color programmatically does not emit color_changed, and _syncing
+	# guards the handler anyway.
+	if ui.has("shadow_tint") and ui["shadow_tint"] is ColorPickerButton:
+		ui["shadow_tint"].color = get_shadow_tint()
 	if _mode_buttons.size() == 3:
 		_set_mode_buttons(int(sun.get("mode", 2)))
 	_syncing = false

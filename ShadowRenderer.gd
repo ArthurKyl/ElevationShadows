@@ -387,10 +387,14 @@ func rebuild():
 		sprite.scale = Vector2(
 			raster_rect.size.x / bake_size.x,
 			raster_rect.size.y / bake_size.y)
-		# Converts the baked red channel back into shadow alpha.
+		# Converts the baked red channel back into shadow alpha. The tint is
+		# RGB-only (get_shadow_tint forces alpha 1) — darkness stays Strength's
+		# job via the bake's red. Also pushed by update_uniforms() so colour
+		# changes are instant without a rebuild; set here too so the very first
+		# frame after a rebuild is already right.
 		var disp = ShaderMaterial.new()
 		disp.shader = _display_shader
-		disp.set_shader_param("shadow_color", Color(0, 0, 0, 1))
+		disp.set_shader_param("shadow_color", sun_settings.get_shadow_tint())
 		sprite.material = disp
 
 		# Put the ghost back where the user's front/back arrangement had it
@@ -722,6 +726,12 @@ func update_uniforms():
 	# unowned and punching a hole in the shadow.
 	var attr_bias = self_bias / 3.0
 
+	# The shadow's colour cast. Lives on the DISPLAY material (the ghost prop's
+	# sprite), not the march material — the bake stays a pure strength field in
+	# red; ShadowDisplay recombines it as vec4(tint.rgb, red). Alpha is forced
+	# to 1 by the getter so darkness remains solely Strength's.
+	var tint = sun_settings.get_shadow_tint()
+
 	var last = _groups.size() - 1
 	for g in _groups:
 		var m = g["material"]
@@ -794,6 +804,12 @@ func update_uniforms():
 		m.set_shader_param("beam_above", beam_above_tex if beam_above_tex != null else tex_a)
 		m.set_shader_param("use_beam_above", 1.0 if beam_above_tex != null else 0.0)
 
+		# Tint goes to the visible sprite's display material, so a colour change
+		# is a parameter write like every other uniform — no rebuild.
+		var spr = g["sprite"]
+		if spr != null and is_instance_valid(spr) and spr.material != null:
+			spr.material.set_shader_param("shadow_color", tint)
+
 	# The beam-mask quads depend on the sun (direction, altitude, softness),
 	# so they are rebuilt with every uniform change — a handful of small
 	# meshes, cheap next to the march. They do NOT depend on opacity: the
@@ -804,10 +820,10 @@ func update_uniforms():
 	# keep showing the previous march.
 	_thaw_bake()
 
-	outputlog("uniforms (%d group(s)): sun_dir=%s alt=%.1f+-%.1f (tan %.3f..%.3f) max_dist=%.0fpx steps=%d base_stride=%.1fpx (%.1f texels) growth=%.4f tiers=%.1f opacity=%.2f self_bias=%.3f attr_bias=%.3f field_b=%s" % [
+	outputlog("uniforms (%d group(s)): sun_dir=%s alt=%.1f+-%.1f (tan %.3f..%.3f) max_dist=%.0fpx steps=%d base_stride=%.1fpx (%.1f texels) growth=%.4f tiers=%.1f opacity=%.2f self_bias=%.3f attr_bias=%.3f field_b=%s tint=#%s" % [
 		_groups.size(), str(sun_dir), altitude, spread, tan_lo, tan_hi, max_dist, steps,
 		base_stride, base_stride / max(0.001, texel_px), growth, max_tiers,
-		float(sun.get("opacity", 0.55)), self_bias, attr_bias, str(have_b)], 1)
+		float(sun.get("opacity", 0.55)), self_bias, attr_bias, str(have_b), tint.to_html(false)], 1)
 
 #########################################################################################################
 ## PORTAL LIGHT BEAMS — a multiplicative mask over the SOLID wall's shadow
