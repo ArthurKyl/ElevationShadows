@@ -67,6 +67,9 @@ const SIDE_NAMES = ["Side A", "Side B", "Wall (both)"]
 var pt_ui = {}      # PathTool controls (defaults for new paths)
 var st_ui = {}      # SelectTool controls (edits current selection)
 var new_path_defaults = {}
+# What newly placed portals get stamped with (PortalTool panel toggle).
+# Session-sticky, like DD's own tool options.
+var new_portal_open_default = true
 
 var _syncing = false
 var _current_path = null
@@ -246,6 +249,19 @@ func caster_fingerprint() -> int:
 			for portal in portals:
 				if portal == null or not is_instance_valid(portal):
 					continue
+				# STAMP new portals with the PortalTool panel's default. DD has
+				# no placement signal, but this pass visits every portal on a
+				# casting wall each tick, so a freshly placed one is stamped
+				# (and its wall rebuilt, via the changed fingerprint) within
+				# the poll interval. Stamping makes the value durable: changing
+				# the tool default later never retroactively flips old portals.
+				var pnid = core.get_node_id(portal)
+				if pnid != null:
+					var pstore = _get_portal_store()
+					if not (pstore.has(pnid) and pstore[pnid] is Dictionary and pstore[pnid].has("open")):
+						pstore[pnid] = {"open": new_portal_open_default}
+						outputlog("portal %s: stamped open-for-sunlight = %s (PortalTool default)" % [
+							pnid, str(new_portal_open_default)], 1)
 				h = int(h * 31 + (7 if is_portal_open(portal) else 3)) % 0x7FFFFFFF
 				h = int(h * 31 + int(portal.global_position.x * 0.53 + portal.global_position.y * 0.29)) % 0x7FFFFFFF
 	return h
@@ -305,7 +321,43 @@ func initialise():
 	new_path_defaults = CASTER_DEFAULTS.duplicate()
 	_build_path_tool_ui()
 	_build_select_tool_ui()
+	_build_portal_tool_ui()
 	outputlog("initialised", 0)
+
+# The same "Open for sunlight" choice, offered while PLACING portals: newly
+# placed portals are stamped with this value (see caster_fingerprint), and the
+# Select-tool toggle then edits that same stored value per portal.
+func _build_portal_tool_ui():
+	var panel = global.Editor.Toolset.GetToolPanel("PortalTool")
+	if panel == null:
+		outputlog("PortalTool panel not found", 0)
+		return
+	var align = core.get_align_vbox(panel)
+	if align == null:
+		outputlog("PortalTool Align VBox not found", 0)
+		return
+
+	var container = VBoxContainer.new()
+	container.name = "ElevationShadowsPortalToolDefaults"
+	container.add_child(HSeparator.new())
+	var row = HBoxContainer.new()
+	var label = Label.new()
+	label.text = "Open for sunlight"
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	label.hint_tooltip = ("New portals let the elevation sun through the wall they\n" +
+		"sit on. Change a placed portal later via the Select tool.")
+	row.add_child(label)
+	var toggle = CheckButton.new()
+	toggle.pressed = new_portal_open_default
+	toggle.connect("toggled", self, "_on_portal_tool_default_toggled")
+	row.add_child(toggle)
+	container.add_child(row)
+	align.add_child(container)
+	outputlog("PortalTool UI added", 0)
+
+func _on_portal_tool_default_toggled(pressed):
+	new_portal_open_default = pressed
+	outputlog("new-portal default open-for-sunlight = %s" % str(pressed), 0)
 
 func _build_path_tool_ui():
 	var panel = global.Editor.Toolset.GetToolPanel("PathTool")
