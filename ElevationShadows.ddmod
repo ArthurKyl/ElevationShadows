@@ -1,0 +1,8 @@
+{
+    "name": "Elevation Shadows",
+    "unique_id": "arthur.ElevationShadows",
+    "version": "0.2.0",
+    "author": "arthur",
+    "description": "Sun-aware terrain shadows cast from cliff contour paths: per-layer shadows that respect DD layers and Bring to front/Send to back, soften with distance, and hide under cliff art.",
+    "dd_version": "1.2.0.1"
+}
