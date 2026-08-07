@@ -165,8 +165,58 @@ func get_caster_nodes() -> Array:
 # derived from them then parked at z=1, underneath every path, wall and object.
 # With per-layer groups an empty caster set produces zero groups and zero sprites,
 # so there is no z left to get wrong.
+#
+# ABSOLUTE z, accumulated the way Godot does (add while z_as_relative, walking
+# up). For paths this equals node.z_index (the Pathways container is at z 0),
+# but a WALL's own z is 0 inside DD's Walls container at z 600 — reading just
+# z_index would group every wall as "layer 0" and park its shadow underneath
+# the map. Walls therefore land in a layer-600 group: shadow over every user
+# layer, wall art (Walls container, later in tree order at the same z) over
+# its own shadow.
 func get_caster_layer(node) -> float:
-	return float(node.z_index)
+	var z = 0
+	var walker = node
+	var guard = 0
+	while walker != null and walker is Node2D and guard < 16:
+		z += walker.z_index
+		if not walker.z_as_relative:
+			break
+		walker = walker.get_parent()
+		guard += 1
+	return float(z)
+
+# Cheap change-detector over the enabled caster set, polled by Core. Nothing in
+# DD announces "a path was deleted" (or un-deleted, hidden, moved, re-layered,
+# or had its points dragged), and without a trigger the height field keeps
+# rasterising the stale geometry — the reported symptom was a deleted cliff
+# whose shadow stayed and still reacted to the sun sliders (uniform changes
+# re-bake from the SAME stale field). Folds in existence, visibility, layer and
+# a coordinate checksum, so any of those movements changes the number.
+func caster_fingerprint() -> int:
+	var h = 0
+	var store = _get_store()
+	for nid in store.keys():
+		if not store[nid].get("enabled", false):
+			continue
+		h = int(h * 31 + str(nid).hash()) % 0x7FFFFFFF
+		if not global.World.HasNodeID(nid):
+			continue
+		var node = global.World.GetNodeByID(nid)
+		if node == null or not is_instance_valid(node):
+			continue
+		var vis = 0
+		if node.has_method("is_visible_in_tree") and node.is_visible_in_tree():
+			vis = 1
+		h = int(h * 31 + int(get_caster_layer(node)) * 2 + vis) % 0x7FFFFFFF
+		var pts = node.get("points")
+		if pts == null:
+			pts = node.get("Points")
+		if pts != null:
+			var checksum = 0.0
+			for p in pts:
+				checksum += p.x * 0.13 + p.y * 0.71
+			h = int(h * 31 + pts.size() * 131 + int(checksum)) % 0x7FFFFFFF
+	return h
 
 # Effective "Art above shadow" for a path: the stored value if the user set it,
 # otherwise the caster flag (casters protect their own art by default,

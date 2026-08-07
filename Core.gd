@@ -74,14 +74,18 @@ func get_align_vbox(tool_panel):
 					return sub
 	return null
 
-# A DD path node is a Line2D exposing FadeIn. Walls expose Joint; portals expose
-# WallID. We only handle paths as casters for now.
+# Nodes that can cast elevation shadows. A DD path is a Line2D exposing FadeIn.
+# A DD WALL exposes Joint and a C# Points property — it is NOT a Line2D itself:
+# it is a Node2D that builds child Line2D segments (which is how portals cut
+# gaps into it). Portals expose WallID and are excluded.
 func is_path_node(node) -> bool:
 	if node == null or not is_instance_valid(node):
 		return false
 	if node.get("WallID") != null:
 		return false
-	return node.get("FadeIn") != null
+	if node.get("FadeIn") != null:
+		return true
+	return node.get("Joint") != null and node.get("Points") != null
 
 # Reorder a path's points into a canonical direction.
 #
@@ -384,8 +388,28 @@ func update(_delta):
 	if _order_sync_accum >= ORDER_SYNC_INTERVAL:
 		_order_sync_accum = 0.0
 		_check_level_switch()
+		_check_caster_changes()
 		if shadow_renderer != null:
 			shadow_renderer.sync_order_store()
+
+var _last_caster_fp = 0
+
+# DD has no delete/edit signal for paths or walls, so caster geometry changes
+# are detected by fingerprint on the same tick. A deleted caster otherwise
+# leaves its shadow baked into the field forever (and the sun sliders keep
+# re-baking from that stale field, which looks extra haunted).
+func _check_caster_changes():
+	if path_tagging == null or get_mode() != MODE_LIVE:
+		return
+	var fp = path_tagging.caster_fingerprint()
+	if fp == _last_caster_fp:
+		return
+	var first = _last_caster_fp == 0
+	_last_caster_fp = fp
+	if first:
+		return
+	outputlog("caster set/geometry changed — rebuilding field", 1)
+	request_rebuild(false, true)
 
 func _check_level_switch():
 	var level = Global.World.GetCurrentLevel()

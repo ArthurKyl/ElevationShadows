@@ -192,10 +192,17 @@ func _to_packed(arr) -> PoolVector2Array:
 
 func _world_points(path) -> PoolVector2Array:
 	var out = PoolVector2Array()
-	for p in path.points:
+	# Paths are Line2D (`points`); DD walls are Node2D with a C# `Points`
+	# property (their visible art lives in child Line2D segments).
+	var src = path.get("points")
+	if src == null:
+		src = path.get("Points")
+	if src == null:
+		return out
+	for p in src:
 		out.append(path.to_global(p))
-	# Same canonical ordering ShadowBuilder applies, so both modules agree on
-	# which side of a contour Side A denotes.
+	# Canonical ordering so Side A means the same geometric side regardless of
+	# which end the user drew from.
 	return core.orient_points(out)
 
 func _is_closed(path) -> bool:
@@ -263,7 +270,12 @@ func _path_strip_polygons(path, inset: float) -> Array:
 	if pts.size() < 2:
 		return []
 	var raw_width = path.get("width")
-	var half = (float(raw_width) * 0.5) if raw_width != null else 64.0
+	if raw_width == null:
+		# Walls have no width of their own; their child Line2D segments do.
+		for line in _art_lines(path):
+			raw_width = line.width
+			break
+	var half = (float(raw_width) * 0.5) if raw_width != null else 32.0
 	half = max(4.0, half - max(0.0, inset))
 	var end_type = Geometry.END_JOINED if _is_closed(path) else Geometry.END_ROUND
 	var strips = Geometry.offset_polyline_2d(_to_packed(pts), half, Geometry.JOIN_ROUND, end_type)
@@ -1168,41 +1180,44 @@ func _build_art_masks(vp_size: Vector2):
 
 		var chan_color = [Vector3(1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)][channel]
 		for path in by_layer[layer_key]:
-			var copy = Line2D.new()
-			copy.points = path.points
-			copy.width = path.width
-			copy.texture = path.texture
-			# Match how DD stretches the texture along the path, or the mask will
-			# not align with what is drawn on screen.
-			for prop in ["texture_mode", "joint_mode", "begin_cap_mode", "end_cap_mode",
-				"round_precision", "sharp_limit", "antialiased"]:
-				var val = path.get(prop)
-				if val != null:
-					copy.set(prop, val)
-			var curve = path.get("width_curve")
-			if curve != null:
-				copy.width_curve = curve
-			# Alpha is what matters; force full opacity so a semi-transparent path
-			# still masks its own footprint. MaskChannel.shader turns that alpha
-			# into this slot's channel.
-			copy.default_color = Color(1, 1, 1, 1)
-			copy.position = path.global_position
-			copy.rotation = path.global_rotation
-			copy.scale = path.global_scale
-			var mat = ShaderMaterial.new()
-			mat.shader = _mask_shader
-			mat.set_shader_param("channel", chan_color)
-			# Per-path "Shadow inset", as an ALPHA EROSION across the strip.
-			# NEVER as a width change: with TILE texture mode the tiling count
-			# derives from the width, so shrinking it rescaled the art along the
-			# path — the mask slid lengthwise and the visible shadow boundary
-			# (which reads as "where the shadow comes from") moved with it.
-			# UV.y spans the width, so uv units = px / width.
-			var inset = float(path_tagging.get_config(path).get("mask_inset", 0.0))
-			mat.set_shader_param("inset_uv", inset / max(1.0, float(path.width)))
-			copy.material = mat
-			root.add_child(copy)
-			copied += 1
+			var inset = float(path_tagging.get_config(path).get("mask_inset", 5.0))
+			# A path IS a Line2D; a wall's art lives in its child Line2D
+			# segments (already portal-gapped). Copy whichever carries the art.
+			for src in _art_lines(path):
+				var copy = Line2D.new()
+				copy.points = src.points
+				copy.width = src.width
+				copy.texture = src.texture
+				# Match how DD stretches the texture along the line, or the mask
+				# will not align with what is drawn on screen.
+				for prop in ["texture_mode", "joint_mode", "begin_cap_mode", "end_cap_mode",
+					"round_precision", "sharp_limit", "antialiased"]:
+					var val = src.get(prop)
+					if val != null:
+						copy.set(prop, val)
+				var curve = src.get("width_curve")
+				if curve != null:
+					copy.width_curve = curve
+				# Alpha is what matters; force full opacity so a semi-transparent
+				# line still masks its own footprint. MaskChannel.shader turns
+				# that alpha into this slot's channel.
+				copy.default_color = Color(1, 1, 1, 1)
+				copy.position = src.global_position
+				copy.rotation = src.global_rotation
+				copy.scale = src.global_scale
+				var mat = ShaderMaterial.new()
+				mat.shader = _mask_shader
+				mat.set_shader_param("channel", chan_color)
+				# Per-path "Shadow inset", as an ALPHA EROSION across the strip.
+				# NEVER as a width change: with TILE texture mode the tiling
+				# count derives from the width, so shrinking it rescaled the art
+				# along the path — the mask slid lengthwise and the visible
+				# shadow boundary moved with it. UV.y spans the width, so
+				# uv units = px / width.
+				mat.set_shader_param("inset_uv", inset / max(1.0, float(src.width)))
+				copy.material = mat
+				root.add_child(copy)
+				copied += 1
 		matched += 1
 		outputlog("art mask slot %d/layer %d -> chain %d channel %s, %d path(s)" % [
 			gi, layer_key, ci, ["R", "G", "B"][channel], by_layer[layer_key].size()], 0)
@@ -1222,6 +1237,18 @@ func _build_art_masks(vp_size: Vector2):
 	if copied > 0:
 		outputlog("art mask built: %d path(s) across %d layer(s), %d mask target(s)" % [
 			copied, matched, _mask_chain_count()], 0)
+
+# The Line2D nodes that carry a caster's visible artwork: the node itself for
+# paths, its direct Line2D children for walls (DD builds those per segment,
+# with portal gaps already cut).
+func _art_lines(node) -> Array:
+	if node is Line2D:
+		return [node]
+	var out = []
+	for child in node.get_children():
+		if child is Line2D:
+			out.append(child)
+	return out
 
 func _make_mask_chain(vp_size: Vector2) -> Dictionary:
 	var vp = Viewport.new()
