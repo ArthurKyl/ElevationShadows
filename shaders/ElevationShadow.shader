@@ -123,6 +123,7 @@ void fragment() {
 	float above = 0.0;      // strongest shadow owned by a higher slot
 	float mt_mine = 0.0;    // largest horizon tangent seen for this slot
 	float mt_above = 0.0;   // ... and for higher slots
+	float crossed = 0.0;    // has this ray entered a blocker strip yet
 
 	// Highest an occluder could possibly stand above this pixel.
 	float head_room = max(0.0, max_tiers - h0) * tier_px;
@@ -237,13 +238,23 @@ void fragment() {
 			}
 		}
 
-		// Blocker check AFTER this step's occlusion: elevation rising at the
-		// blocker's own strip (a wall that both casts and blocks) still shades
-		// the near side, but nothing beyond the strip does. The blocker raster
-		// is unblurred and FILTER-sampled, so the 0.3 threshold triggers a bit
-		// outside the exact strip edge — erring towards blocking.
-		if (use_blocker > 0.5 && texture(blocker_tex, uv_s).r > 0.3) {
-			break;
+		// Blocker: break on EXIT, not on contact. A wall that both casts and
+		// blocks is its own blocker — the blocker strip and the elevation
+		// strip are the SAME strip, and both have soft edges (FILTER smear vs
+		// the level_blend ramp). Breaking on first contact raced those edges:
+		// a step could land on the blocker fringe a texel before the
+		// elevation ramp cleared self_bias, ending the march before the
+		// wall's own height ever registered — the wall's shadow survived only
+		// 1-2 squares out (fine strides win the race near the wall) and
+		// vanished beyond. Tracking "inside" and breaking on the first sample
+		// PAST the strip lets every on-strip sample register elevation while
+		// still stopping everything beyond it.
+		if (use_blocker > 0.5) {
+			if (texture(blocker_tex, uv_s).r > 0.3) {
+				crossed = 1.0;
+			} else if (crossed > 0.5) {
+				break;
+			}
 		}
 	}
 
