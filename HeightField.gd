@@ -273,7 +273,7 @@ func _uphill_sample_points(pts: PoolVector2Array, side: int) -> Array:
 # hole from each half; the results are simple polygons. Open paths whose round
 # end caps overlap (a circle drawn without closing the loop) produce the same
 # ring-with-hole shape, so this handles them identically.
-func _path_strip_polygons(path, inset: float) -> Array:
+func _path_strip_polygons(path, inset: float, cut_portals: bool = true) -> Array:
 	var pts = _world_points(path)
 	if pts.size() < 2:
 		return []
@@ -285,6 +285,23 @@ func _path_strip_polygons(path, inset: float) -> Array:
 			break
 	var half = (float(raw_width) * 0.5) if raw_width != null else 32.0
 	half = max(4.0, half - max(0.0, inset))
+	# THE STRIP MUST SURVIVE THE BLUR. The march reads the SMOOTHED field, and
+	# a strip much narrower than the Gaussian kernel nearly vanishes from it.
+	# This wall's art was ~18 px, the strip came out 8 px = 1.35 field texels,
+	# and at sigma = level_blend = 4 texels the blurred peak kept ~10-14% — a
+	# 2.8-tier wall marched as ~0.39 tiers and its shadow collapsed to ~10% of
+	# its length, while every probe (which reads the RAW raster) kept reporting
+	# full height. Two cold-read agents independently root-caused and verified
+	# this numerically (2026-08-07). Floor the half-width at 2*sigma texels
+	# (strip = 4*sigma keeps ~95% of its height); the cost is the elevation
+	# footprint being wider than thin art, which shows as a small lit margin
+	# around the wall before its shadow starts.
+	var blend = float(sun_settings.get_sun().get("level_blend", 2.0))
+	var min_half = min(2.0 * max(0.35, blend) / max(0.0001, _vp_scale), 128.0)
+	if half < min_half:
+		outputlog("path %s: strip half-width %.0f px below blur-safe %.0f px — widening" % [
+			str(core.get_node_id(path)), half, min_half], 1)
+		half = min_half
 	var end_type = Geometry.END_JOINED if _is_closed(path) else Geometry.END_ROUND
 	var strips = Geometry.offset_polyline_2d(_to_packed(pts), half, Geometry.JOIN_ROUND, end_type)
 
@@ -298,18 +315,15 @@ func _path_strip_polygons(path, inset: float) -> Array:
 		else:
 			solids.append(p)
 
-	for hole in holes:
-		var bbox = _poly_bbox(hole)
-		var cx = bbox.position.x + bbox.size.x * 0.5
-		var next_pieces = []
-		for piece in solids:
-			for half_piece in _split_at_x(piece, cx):
-				for cut in Geometry.clip_polygons_2d(_to_packed(half_piece), _to_packed(hole)):
-					if cut.size() >= 3 and not Geometry.is_polygon_clockwise(cut):
-						next_pieces.append(cut)
-		solids = next_pieces
+	solids = _subtract_holes(solids, holes)
 
-	solids = _cut_open_portals(path, solids, half)
+	# Portal gaps are a WALL-mode concept. The elevation strip only exists in
+	# wall mode, but the BLOCKER raster calls this for Side A/B casters too —
+	# there the path is a terrain step, portals must have zero effect, and
+	# cutting gaps anyway let the taller up-sun terrain's shadow spill through
+	# open doors ("the wall's shadow doubles at open portals" in Side mode).
+	if cut_portals:
+		solids = _cut_open_portals(path, solids, half)
 
 	if solids.size() == 0:
 		outputlog("path %s: wall strip produced no fillable region" % str(core.get_node_id(path)), 0)
@@ -387,6 +401,23 @@ func _dist_to_polyline(pts: PoolVector2Array, p: Vector2) -> float:
 		if d < best:
 			best = d
 	return best
+
+# Subtract CW hole polygons from CCW solids, producing simple (triangulable)
+# pieces: each hole splits every piece vertically through the hole's centre,
+# then the hole is clipped out of each half. Shared by the wall-ring strip and
+# _rect_minus contour fills.
+func _subtract_holes(solids: Array, holes: Array) -> Array:
+	for hole in holes:
+		var bbox = _poly_bbox(hole)
+		var cx = bbox.position.x + bbox.size.x * 0.5
+		var next_pieces = []
+		for piece in solids:
+			for half_piece in _split_at_x(piece, cx):
+				for cut in Geometry.clip_polygons_2d(_to_packed(half_piece), _to_packed(hole)):
+					if cut.size() >= 3 and not Geometry.is_polygon_clockwise(cut):
+						next_pieces.append(cut)
+		solids = next_pieces
+	return solids
 
 # The polygon's parts left and right of the vertical line at cx.
 func _split_at_x(poly, cx: float) -> Array:
@@ -594,6 +625,21 @@ func _map_area() -> float:
 	return max(1.0, _map_rect.size.x * _map_rect.size.y)
 
 # Map rectangle with `hole` removed — used when uphill is outside a closed loop.
+#
+# clip_polygons_2d expresses the result as the outer boundary PLUS the hole's
+# outline (clockwise). Returning both raw used to be catastrophic, in two ways
+# found independently by both cold-read agents (2026-08-07):
+#   * rebuild() cleaned each polygon in ISOLATION — merge_polygons_2d(hole,
+#     hole) normalised the CW hole into a solid — and the additive blend then
+#     stacked a SECOND helping of height inside the loop: the whole map gained
+#     a phantom tier per closed contour and loop interiors sat at 2h instead
+#     of 0 (tier histogram baseline 4 instead of 1; measured stack 14.05 tiers
+#     vs the analytic bound 11.8, which is impossible without double-fill).
+#   * _pick_by_vote counted a sample inside the loop as inside the rect-minus
+#     candidate TOO (via the hole member) — the log showed "votes 2 vs 5 of 3
+#     samples" — inverting the side vote toward rect-minus.
+# Resolving the hole HERE, into disjoint simple solids, fixes the fill, the
+# vote and the area comparison in one place.
 func _rect_minus(hole: Array) -> Array:
 	if _raster_rect == null:
 		return []
@@ -604,10 +650,16 @@ func _rect_minus(hole: Array) -> Array:
 		Vector2(_raster_rect.position.x, _raster_rect.end.y),
 	]
 	var result = Geometry.clip_polygons_2d(_to_packed(rect_poly), _to_packed(hole))
-	var out = []
+	var solids = []
+	var cw_holes = []
 	for poly in result:
-		out.append(poly)
-	return out
+		if poly.size() < 3:
+			continue
+		if Geometry.is_polygon_clockwise(poly):
+			cw_holes.append(poly)
+		else:
+			solids.append(poly)
+	return _subtract_holes(solids, cw_holes)
 
 #########################################################################################################
 ## RASTERISE
@@ -1352,7 +1404,11 @@ func _build_blockers(vp_size: Vector2):
 		# Full width (inset 0): a blocker should stop shadows at the wall's
 		# footprint, and a slightly generous edge also guards against the
 		# march's growing stride stepping over a thin strip.
-		for poly in _path_strip_polygons(node, 0.0):
+		# Portal gaps only when the caster itself is in Wall mode — in Side A/B
+		# the path is a terrain step and portals must not touch the blocker
+		# either (see _path_strip_polygons).
+		var gaps = int(path_tagging.get_config(node).get("side", 0)) == 2
+		for poly in _path_strip_polygons(node, 0.0, gaps):
 			var mesh = _make_polygon_mesh(poly, Color(1, 1, 1, 1))
 			if mesh == null:
 				continue
