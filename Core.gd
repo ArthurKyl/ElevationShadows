@@ -30,6 +30,11 @@ var logging_level = 1
 const SUN_KEY = "ElevationShadowsSun"
 const CASTER_KEY = "ElevationShadowsCasters"
 const ORDER_KEY = "ElevationShadowsOrder"
+# Per-portal override for "does sunlight pass here", keyed by node_id.
+# DD's own Portal.Closed defaults to false and (at least in this DD build)
+# has no reachable UI, so the mod exposes its own toggle; the DD flag is only
+# the fallback default.
+const PORTAL_KEY = "ElevationShadowsPortals"
 
 var SunSettingsScript
 var PathTaggingScript
@@ -86,6 +91,12 @@ func is_path_node(node) -> bool:
 	if node.get("FadeIn") != null:
 		return true
 	return node.get("Joint") != null and node.get("Points") != null
+
+# A door/window on a wall. Portals are the only things exposing WallID.
+func is_portal_node(node) -> bool:
+	if node == null or not is_instance_valid(node):
+		return false
+	return node.get("WallID") != null
 
 # Reorder a path's points into a canonical direction.
 #

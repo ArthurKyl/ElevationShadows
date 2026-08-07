@@ -70,6 +70,7 @@ var new_path_defaults = {}
 
 var _syncing = false
 var _current_path = null
+var _current_portal = null
 
 func outputlog(msg, level = 0):
 	if core != null:
@@ -83,6 +84,27 @@ func _get_store() -> Dictionary:
 	if not global.ModMapData.has(core.CASTER_KEY):
 		global.ModMapData[core.CASTER_KEY] = {}
 	return global.ModMapData[core.CASTER_KEY]
+
+func _get_portal_store() -> Dictionary:
+	if not global.ModMapData.has(core.PORTAL_KEY):
+		global.ModMapData[core.PORTAL_KEY] = {}
+	return global.ModMapData[core.PORTAL_KEY]
+
+# Does sunlight pass through this portal? The mod's own per-portal toggle wins;
+# otherwise DD's Portal.Closed decides (its default is false = open — and this
+# DD build exposes no UI for it, which is why the mod has its own toggle).
+# Both the wall-strip gap cutting and the caster fingerprint go through here,
+# so the override and the DD flag can never disagree between them.
+func is_portal_open(portal) -> bool:
+	var nid = core.get_node_id(portal)
+	if nid != null:
+		var store = _get_portal_store()
+		if store.has(nid) and store[nid] is Dictionary and store[nid].has("open"):
+			return bool(store[nid]["open"])
+	var closed = portal.get("Closed")
+	if closed != null:
+		return not bool(closed)
+	return false
 
 func get_config(node) -> Dictionary:
 	var nid = core.get_node_id(node)
@@ -217,14 +239,14 @@ func caster_fingerprint() -> int:
 				checksum += p.x * 0.13 + p.y * 0.71
 			h = int(h * 31 + pts.size() * 131 + int(checksum)) % 0x7FFFFFFF
 		# Walls: doors opening/closing (and portals added/moved) change where
-		# light passes through the strip, so they must re-rasterise too.
+		# light passes through the strip, so they must re-rasterise too. Uses
+		# the EFFECTIVE state (mod override, else DD's Closed flag).
 		var portals = node.get("Portals")
 		if portals != null:
 			for portal in portals:
 				if portal == null or not is_instance_valid(portal):
 					continue
-				var closed = portal.get("Closed")
-				h = int(h * 31 + (3 if (closed != null and bool(closed)) else 7)) % 0x7FFFFFFF
+				h = int(h * 31 + (7 if is_portal_open(portal) else 3)) % 0x7FFFFFFF
 				h = int(h * 31 + int(portal.global_position.x * 0.53 + portal.global_position.y * 0.29)) % 0x7FFFFFFF
 	return h
 
@@ -443,6 +465,32 @@ func _build_select_tool_ui():
 
 	align.add_child(container)
 	st_ui["container"] = container
+
+	# Portal section, shown when a door/window is selected. DD's own
+	# Portal.Closed has no reachable UI in this build, so this is the user's
+	# way to shut a doorway against the sun.
+	var pcontainer = VBoxContainer.new()
+	pcontainer.name = "ElevationShadowsPortalTool"
+	pcontainer.visible = false
+	pcontainer.add_child(HSeparator.new())
+	var prow = HBoxContainer.new()
+	var plabel = Label.new()
+	plabel.text = "Open for sunlight"
+	plabel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	plabel.hint_tooltip = ("Whether this door/window lets the elevation sun through\n" +
+		"the wall it sits on: open = a gap in the wall's shadow (and\n" +
+		"cliff shadows behind pass through the doorway), off = the\n" +
+		"wall casts as if solid. Only matters on walls that cast\n" +
+		"elevation shadows.")
+	prow.add_child(plabel)
+	var ptoggle = CheckButton.new()
+	ptoggle.connect("toggled", self, "_on_st_portal_open_toggled")
+	prow.add_child(ptoggle)
+	pcontainer.add_child(prow)
+	align.add_child(pcontainer)
+	st_ui["portal_container"] = pcontainer
+	st_ui["portal_open"] = ptoggle
+
 	outputlog("SelectTool UI added", 0)
 
 #########################################################################################################
@@ -466,10 +514,20 @@ func _on_pt_side_pressed():
 func on_selection_changed():
 	var selected = global.Editor.Tools["SelectTool"].Selected
 	var path = null
+	var portal = null
 	for node in selected:
-		if core.is_path_node(node):
+		if path == null and core.is_path_node(node):
 			path = node
-			break
+		elif portal == null and core.is_portal_node(node):
+			portal = node
+
+	_current_portal = portal
+	if st_ui.has("portal_container"):
+		st_ui["portal_container"].visible = portal != null
+		if portal != null:
+			_syncing = true
+			st_ui["portal_open"].pressed = is_portal_open(portal)
+			_syncing = false
 
 	_current_path = path
 	if not st_ui.has("container"):
@@ -552,6 +610,21 @@ func _on_st_art_above_toggled(pressed):
 	if _syncing or _current_path == null:
 		return
 	set_config_value(_current_path, "art_above", pressed)
+
+func _on_st_portal_open_toggled(pressed):
+	if _syncing or _current_portal == null:
+		return
+	var nid = core.get_node_id(_current_portal)
+	if nid == null:
+		outputlog("Cannot store portal state: portal has no node_id", 0)
+		return
+	var store = _get_portal_store()
+	if not (store.has(nid) and store[nid] is Dictionary):
+		store[nid] = {}
+	store[nid]["open"] = pressed
+	outputlog("portal %s: open for sunlight = %s" % [nid, str(pressed)], 0)
+	if core != null:
+		core.request_rebuild(false, true)
 
 func _on_st_inset_changed(value):
 	if _syncing or _current_path == null:

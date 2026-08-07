@@ -327,8 +327,9 @@ func _cut_open_portals(path, solids: Array, half: float) -> Array:
 	for portal in portals:
 		if portal == null or not is_instance_valid(portal):
 			continue
-		var closed = portal.get("Closed")
-		if closed == null or bool(closed):
+		# Effective state: the mod's per-portal "Open for sunlight" toggle,
+		# falling back to DD's Portal.Closed flag.
+		if not path_tagging.is_portal_open(portal):
 			continue
 		var a = portal.get("Begin")
 		var b = portal.get("End")
