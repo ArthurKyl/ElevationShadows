@@ -131,37 +131,25 @@ func get_blocker_nodes() -> Array:
 # are nodes in the level's Portals container referencing their wall by WallID
 # (int32); resolving WallID through DD's own GetNodeByID and comparing node
 # identity sidesteps every id-format question.
+# Wall-attached portals are CHILDREN OF THE WALL NODE: Wall::AddPortal
+# instances the portal scene and AddChilds it to the wall (verified in the
+# assembly). The level's Portals container — where two earlier versions of
+# this lookup searched, silently finding nothing — holds only FREESTANDING
+# portals.
 func get_wall_portals(wall, verbose: bool = false) -> Array:
 	var out = []
-	var level = global.World.GetCurrentLevel()
-	if level == null:
-		return out
-	var container = level.get("Portals")
-	if container == null:
-		if verbose:
-			outputlog("portal scan: Level.Portals container not found", 0)
-		return out
-	var seen = 0
 	var report = PoolStringArray()
-	for child in container.get_children():
+	for child in wall.get_children():
 		if child == null or not is_instance_valid(child):
 			continue
-		var wid = child.get("WallID")
-		if wid == null:
+		if child.get("WallID") == null:
 			continue
-		seen += 1
-		var owner = null
-		if global.World.HasNodeID(wid):
-			owner = global.World.GetNodeByID(wid)
+		out.append(child)
 		if verbose and report.size() < 8:
-			report.append("wid=%s->%s open=%s" % [
-				str(wid), "THIS WALL" if owner == wall else ("dead" if owner == null else "other"),
-				str(is_portal_open(child))])
-		if owner == wall:
-			out.append(child)
+			report.append("open=%s" % str(is_portal_open(child)))
 	if verbose:
-		outputlog("portal scan for wall %s: %d children, %d portal(s), %d attached to this wall | %s" % [
-			str(core.get_node_id(wall)), container.get_child_count(), seen, out.size(),
+		outputlog("portal scan for wall %s: %d portal(s) among %d wall children | %s" % [
+			str(core.get_node_id(wall)), out.size(), wall.get_child_count(),
 			report.join(" ; ")], 0)
 	return out
 
