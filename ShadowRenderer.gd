@@ -140,7 +140,62 @@ func initialise():
 	if _display_shader == null:
 		outputlog("FATAL: shaders/ShadowDisplay.shader failed to load", 0)
 		return
+	_pattern_shader = ResourceLoader.load(
+		global.Root + "shaders/PatternShadow.shader", "Shader", true)
+	if _pattern_shader == null:
+		outputlog("WARNING: PatternShadow.shader failed to load — no portal beams/patterns", 0)
+	_make_pattern_textures()
 	outputlog("shaders loaded", 0)
+
+#########################################################################################################
+## PORTAL LIGHT PATTERNS
+#########################################################################################################
+# Generated at runtime — no asset files. Index 0 (None) is a plain opening.
+# Alpha is the blocker: opaque parts shade, transparent parts pass light. The
+# same contract a future custom-asset option would use ("anything that isn't
+# 0% opacity blocks at full strength").
+
+var _pattern_shader = null
+var _pattern_textures = []
+
+func _make_pattern_textures():
+	_pattern_textures = [null]
+	for idx in range(1, 6):
+		var img = Image.new()
+		img.create(64, 64, false, Image.FORMAT_RGBA8)
+		img.lock()
+		for y in range(64):
+			for x in range(64):
+				var a = _pattern_alpha(idx, (x + 0.5) / 64.0, (y + 0.5) / 64.0)
+				img.set_pixel(x, y, Color(1, 1, 1, a))
+		img.unlock()
+		var tex = ImageTexture.new()
+		tex.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER)
+		_pattern_textures.append(tex)
+	outputlog("%d light patterns generated" % (_pattern_textures.size() - 1), 1)
+
+# u across the span, v UP the opening's face; one tile = `tile` ft.
+func _pattern_alpha(idx: int, u: float, v: float) -> float:
+	if idx == 1:
+		# Bars — portcullis / gate.
+		return 1.0 if abs(u - 0.5) < 0.20 else 0.0
+	if idx == 2:
+		# Window panes — frame lines tile into the classic cross grid.
+		return 1.0 if (u < 0.08 or u > 0.92 or v < 0.08 or v > 0.92) else 0.0
+	if idx == 3:
+		# Diamond lattice — leaded glass.
+		var s = fposmod(u + v, 1.0)
+		var t = fposmod(u - v, 1.0)
+		return 1.0 if (abs(s - 0.5) < 0.08 or abs(t - 0.5) < 0.08) else 0.0
+	if idx == 4:
+		# Plus holes — solid gate pierced by + shaped openings.
+		var du = abs(u - 0.5)
+		var dv = abs(v - 0.5)
+		if (du < 0.17 and dv < 0.40) or (dv < 0.17 and du < 0.40):
+			return 0.0
+		return 1.0
+	# Checker — heavy grate.
+	return 1.0 if ((u < 0.5) != (v < 0.5)) else 0.0
 
 #########################################################################################################
 ## BUILD
@@ -252,6 +307,14 @@ func rebuild():
 		bake_sprite.scale = Vector2(bake_scale, bake_scale)
 		bake_sprite.material = material
 		bake_vp.add_child(bake_sprite)
+		# Portal beam/pattern quads render into the same bake, ON TOP of the
+		# march (additive into red). The root maps world px -> bake px so the
+		# projector can think in world coordinates.
+		var quad_root = Node2D.new()
+		var qs = vp_scale * bake_scale
+		quad_root.scale = Vector2(qs, qs)
+		quad_root.position = -raster_rect.position * qs
+		bake_vp.add_child(quad_root)
 		# A Viewport is not a CanvasItem, so parking it here does not draw into the map.
 		global.Editor.add_child(bake_vp)
 
@@ -305,6 +368,7 @@ func rebuild():
 			"z": int(layer),
 			"bake_vp": bake_vp,
 			"bake_sprite": bake_sprite,
+			"quad_root": quad_root,
 			"material": material,
 			"prop": prop,
 			"sprite": sprite,
@@ -666,6 +730,11 @@ func update_uniforms():
 		m.set_shader_param("blocker_tex", blocker_tex if blocker_tex != null else tex_a)
 		m.set_shader_param("use_blocker", 1.0 if blocker_tex != null else 0.0)
 
+	# The projected portal quads depend on the sun (direction, altitude) and
+	# opacity, so they are rebuilt with every uniform change — a handful of
+	# small meshes, cheap next to the march.
+	_rebuild_pattern_quads()
+
 	# Re-run the bakes with the new parameters. Without this the visible sprites
 	# keep showing the previous march.
 	_thaw_bake()
@@ -674,6 +743,130 @@ func update_uniforms():
 		_groups.size(), str(sun_dir), altitude, spread, tan_lo, tan_hi, max_dist, steps,
 		base_stride, base_stride / max(0.001, texel_px), growth, max_tiers,
 		float(sun.get("opacity", 0.55)), self_bias, attr_bias, str(have_b)], 1)
+
+#########################################################################################################
+## PORTAL BEAM / PATTERN PROJECTION
+#########################################################################################################
+# An open portal is a vertical BAND in the wall's face (sill `bottom` to lintel
+# `top`, in ft), optionally shaped by a pattern. Its effect on the ground
+# projects as skewed parallelograms along the shadow direction — computed here
+# at bake time, so the march never has to know:
+#
+#   d(x ft) = (x/fps) * tier_px / tan(altitude)      distance a height maps to
+#
+#   0        .. d(bottom) : solid shadow  (wall below the sill)
+#   d(bottom).. d(top)    : the pattern's shadow (nothing, for a plain opening)
+#   d(top)   .. d(wall_h) : solid shadow  (wall above the lintel), faded at the
+#                           tail to meet the march's penumbra without a seam
+#
+# The quads render additively into the wall's own layer bake, filling the gap
+# the strip cut left. UV.y runs up the opening's face, so patterns are
+# authored face-on and the projection skews/stretches them with the sun —
+# long dramatic lattices at sunset, compressed at noon.
+
+func _rebuild_pattern_quads():
+	if _pattern_shader == null:
+		return
+	var sun = sun_settings.get_sun()
+	var alt = clamp(float(sun.get("altitude", 35.0)), 1.0, 89.0)
+	var tan_alt = tan(deg2rad(alt))
+	var tier_px = float(sun.get("tier_px", 256.0))
+	var fps = sun_settings.get_feet_per_square()
+	var dirv = sun_settings.get_shadow_direction()
+	var opacity = clamp(float(sun.get("opacity", 0.55)), 0.0, 1.0)
+	var quads = 0
+
+	for g in _groups:
+		var root = g.get("quad_root")
+		if root == null or not is_instance_valid(root):
+			continue
+		for child in root.get_children():
+			child.queue_free()
+		for caster in height_field.get_group_casters(g["slot"]):
+			if caster == null or not is_instance_valid(caster):
+				continue
+			var cfg = path_tagging.get_config(caster)
+			# Only strip walls have portal gaps to fill.
+			if int(cfg.get("side", 0)) != 2:
+				continue
+			var wall_ft = float(cfg.get("height", 1.0)) * fps
+			for portal in path_tagging.get_wall_portals(caster):
+				if not path_tagging.is_portal_open(portal):
+					continue
+				var pcfg = path_tagging.get_portal_cfg(portal)
+				var a = portal.get("Begin")
+				var b = portal.get("End")
+				if not (a is Vector2 and b is Vector2) or (b - a).length() < 1.0:
+					continue
+				var bottom_ft = clamp(float(pcfg.get("bottom", 0.0)), 0.0, wall_ft)
+				var top_ft = clamp(float(pcfg.get("top", 8.0)), bottom_ft, wall_ft)
+				var tile_ft = max(0.5, float(pcfg.get("tile", 2.5)))
+				var pattern = int(clamp(pcfg.get("pattern", 0), 0, _pattern_textures.size() - 1))
+
+				var d_bottom = (bottom_ft / fps) * tier_px / tan_alt
+				var d_top = (top_ft / fps) * tier_px / tan_alt
+				var d_wall = (wall_ft / fps) * tier_px / tan_alt
+				var tile_px = (tile_ft / fps) * tier_px
+				var span_tiles = (b - a).length() / tile_px
+
+				# Wall below the sill.
+				if d_bottom > 1.0:
+					quads += _add_quad(root, a, b, dirv, 0.0, d_bottom,
+						null, 0.0, 0.0, 0.0, opacity, 1.0, 1.0)
+				# The opening itself, pattern-shaped.
+				if pattern > 0 and d_top > d_bottom + 1.0:
+					quads += _add_quad(root, a, b, dirv, d_bottom, d_top,
+						_pattern_textures[pattern], span_tiles,
+						bottom_ft / tile_ft, top_ft / tile_ft, opacity, 1.0, 1.0)
+				# Wall above the lintel: solid, with a faded tail so it meets
+				# the march's penumbra without a hard line.
+				if d_wall > d_top + 1.0:
+					var d_fade = d_top + (d_wall - d_top) * 0.8
+					quads += _add_quad(root, a, b, dirv, d_top, d_fade,
+						null, 0.0, 0.0, 0.0, opacity, 1.0, 1.0)
+					quads += _add_quad(root, a, b, dirv, d_fade, d_wall,
+						null, 0.0, 0.0, 0.0, opacity, 1.0, 0.0)
+	if quads > 0:
+		outputlog("portal projection: %d quad(s) built" % quads, 1)
+
+# One projected parallelogram: span a..b extruded along `dirv` from d0 to d1.
+# UVs tile the pattern across the span (u) and up the opening face (v);
+# alpha0/alpha1 are the vertex alphas at the near/far edge (tail fading).
+func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float,
+	tex, u_tiles: float, v0: float, v1: float, strength: float,
+	alpha0: float, alpha1: float) -> int:
+
+	var p0 = a + dirv * d0
+	var p1 = b + dirv * d0
+	var p2 = b + dirv * d1
+	var p3 = a + dirv * d1
+
+	var verts = PoolVector2Array([p0, p1, p2, p0, p2, p3])
+	var uvs = PoolVector2Array([
+		Vector2(0, v0), Vector2(u_tiles, v0), Vector2(u_tiles, v1),
+		Vector2(0, v0), Vector2(u_tiles, v1), Vector2(0, v1)])
+	var c0 = Color(1, 1, 1, alpha0)
+	var c1 = Color(1, 1, 1, alpha1)
+	var colors = PoolColorArray([c0, c0, c1, c0, c1, c1])
+
+	var arrays = []
+	arrays.resize(ArrayMesh.ARRAY_MAX)
+	arrays[ArrayMesh.ARRAY_VERTEX] = verts
+	arrays[ArrayMesh.ARRAY_TEX_UV] = uvs
+	arrays[ArrayMesh.ARRAY_COLOR] = colors
+	var mesh = ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+
+	var mi = MeshInstance2D.new()
+	mi.mesh = mesh
+	if tex != null:
+		mi.texture = tex
+	var mat = ShaderMaterial.new()
+	mat.shader = _pattern_shader
+	mat.set_shader_param("strength", strength)
+	mi.material = mat
+	root.add_child(mi)
+	return 1
 
 # Growth factor g such that a geometric series of `steps` terms starting at
 # `base` sums to at least `target`:  base * (g^n - 1) / (g - 1) >= target.

@@ -74,6 +74,20 @@ const CASTER_DEFAULTS = {
 
 const SIDE_NAMES = ["Side A", "Side B", "Wall (both)"]
 
+# Per-portal light-opening settings (portal store, keyed by node_id, alongside
+# "open"). All in FEET. The opening is a vertical band in the wall's face from
+# `bottom` to `top`; light passes through it (shaped by `pattern`), while the
+# wall below the sill and above the lintel still shades — which is what makes
+# beams end at a realistic distance instead of streaking across the map.
+const PORTAL_DEFAULTS = {
+	"pattern": 0,     # index into ShadowRenderer.PATTERN_NAMES; 0 = plain opening
+	"top": 8.0,       # ft — lintel height (door tops out here)
+	"bottom": 0.0,    # ft — sill height (0 for doors, raise for windows)
+	"tile": 2.5,      # ft — pattern tile size (one bar/pane/plus per tile)
+}
+
+const PATTERN_NAMES = ["None (open)", "Bars", "Window panes", "Diamond lattice", "Plus holes", "Checker"]
+
 var pt_ui = {}      # PathTool controls (defaults for new paths)
 var st_ui = {}      # SelectTool controls (edits current selection)
 var new_path_defaults = {}
@@ -176,6 +190,32 @@ func get_unattached_portals() -> Array:
 			continue
 		out.append(child)
 	return out
+
+func get_portal_cfg(portal) -> Dictionary:
+	var cfg = PORTAL_DEFAULTS.duplicate()
+	var nid = core.get_node_id(portal)
+	if nid != null:
+		var store = _get_portal_store()
+		if store.has(nid) and store[nid] is Dictionary:
+			for k in store[nid].keys():
+				cfg[k] = store[nid][k]
+	return cfg
+
+func set_portal_value(portal, key: String, value):
+	var nid = core.get_node_id(portal)
+	if nid == null:
+		outputlog("Cannot store portal setting: no node_id", 0)
+		return
+	var store = _get_portal_store()
+	if not (store.has(nid) and store[nid] is Dictionary):
+		store[nid] = {}
+	store[nid][key] = value
+	outputlog("portal %s: %s = %s" % [nid, key, str(value)], 1)
+	# Pattern/heights only reshape the projected quads, which are rebuilt in
+	# update_uniforms — no field re-raster needed ("open" is separate and does
+	# need the field, its handler asks for that itself).
+	if core != null:
+		core.request_rebuild(true, false)
 
 # Does sunlight pass through this portal? The mod's own per-portal toggle wins;
 # otherwise DD's Portal.Closed decides (its default is false = open — and this
@@ -649,6 +689,79 @@ func _build_select_tool_ui():
 	ptoggle.connect("toggled", self, "_on_st_portal_open_toggled")
 	prow.add_child(ptoggle)
 	pcontainer.add_child(prow)
+
+	# Light pattern + opening geometry: what shape the light takes through
+	# this opening, and where the opening sits in the wall's face.
+	var pat_row = HBoxContainer.new()
+	var pat_label = Label.new()
+	pat_label.text = "Light pattern"
+	pat_label.rect_min_size = Vector2(104, 0)
+	pat_label.hint_tooltip = ("Shape of the light coming through: bars, window panes,\n" +
+		"lattice... The pattern is projected onto the ground and\n" +
+		"skews/stretches with the sun, like the classic window\ncross on a floor.")
+	pat_row.add_child(pat_label)
+	var pat_option = OptionButton.new()
+	for name in PATTERN_NAMES:
+		pat_option.add_item(name)
+	pat_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	pat_option.connect("item_selected", self, "_on_st_portal_pattern_selected")
+	pat_row.add_child(pat_option)
+	pcontainer.add_child(pat_row)
+	st_ui["portal_pattern"] = pat_option
+
+	var top_row = HBoxContainer.new()
+	var top_label = Label.new()
+	top_label.text = "Opening top (ft)"
+	top_label.rect_min_size = Vector2(104, 0)
+	top_label.hint_tooltip = ("Lintel height: the wall above it still shades, so the beam\n" +
+		"through the opening ends at a realistic distance.")
+	top_row.add_child(top_label)
+	var top_spin = SpinBox.new()
+	top_spin.min_value = 0.5
+	top_spin.max_value = 240.0
+	top_spin.step = 0.5
+	top_spin.value = 8.0
+	top_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	top_spin.connect("value_changed", self, "_on_st_portal_top_changed")
+	top_row.add_child(top_spin)
+	pcontainer.add_child(top_row)
+	st_ui["portal_top"] = top_spin
+
+	var bot_row = HBoxContainer.new()
+	var bot_label = Label.new()
+	bot_label.text = "Opening bottom (ft)"
+	bot_label.rect_min_size = Vector2(104, 0)
+	bot_label.hint_tooltip = ("Sill height: 0 for doors. Raise for windows — the wall\n" +
+		"below the sill shades the ground nearest the wall.")
+	bot_row.add_child(bot_label)
+	var bot_spin = SpinBox.new()
+	bot_spin.min_value = 0.0
+	bot_spin.max_value = 239.0
+	bot_spin.step = 0.5
+	bot_spin.value = 0.0
+	bot_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bot_spin.connect("value_changed", self, "_on_st_portal_bottom_changed")
+	bot_row.add_child(bot_spin)
+	pcontainer.add_child(bot_row)
+	st_ui["portal_bottom"] = bot_spin
+
+	var tile_row = HBoxContainer.new()
+	var tile_label = Label.new()
+	tile_label.text = "Pattern size (ft)"
+	tile_label.rect_min_size = Vector2(104, 0)
+	tile_label.hint_tooltip = "One bar / pane / plus per this many feet."
+	tile_row.add_child(tile_label)
+	var tile_spin = SpinBox.new()
+	tile_spin.min_value = 0.5
+	tile_spin.max_value = 20.0
+	tile_spin.step = 0.25
+	tile_spin.value = 2.5
+	tile_spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tile_spin.connect("value_changed", self, "_on_st_portal_tile_changed")
+	tile_row.add_child(tile_spin)
+	pcontainer.add_child(tile_row)
+	st_ui["portal_tile"] = tile_spin
+
 	align.add_child(pcontainer)
 	st_ui["portal_container"] = pcontainer
 	st_ui["portal_open"] = ptoggle
@@ -687,8 +800,14 @@ func on_selection_changed():
 	if st_ui.has("portal_container"):
 		st_ui["portal_container"].visible = portal != null
 		if portal != null:
+			var pcfg = get_portal_cfg(portal)
 			_syncing = true
 			st_ui["portal_open"].pressed = is_portal_open(portal)
+			if st_ui.has("portal_pattern"):
+				st_ui["portal_pattern"].selected = int(pcfg.get("pattern", 0))
+				st_ui["portal_top"].value = float(pcfg.get("top", 8.0))
+				st_ui["portal_bottom"].value = float(pcfg.get("bottom", 0.0))
+				st_ui["portal_tile"].value = float(pcfg.get("tile", 2.5))
 			_syncing = false
 
 	_current_path = path
@@ -779,6 +898,26 @@ func _on_st_blocks_toggled(pressed):
 	if _syncing or _current_path == null:
 		return
 	set_config_value(_current_path, "blocks", pressed)
+
+func _on_st_portal_pattern_selected(index):
+	if _syncing or _current_portal == null:
+		return
+	set_portal_value(_current_portal, "pattern", int(index))
+
+func _on_st_portal_top_changed(value):
+	if _syncing or _current_portal == null:
+		return
+	set_portal_value(_current_portal, "top", float(value))
+
+func _on_st_portal_bottom_changed(value):
+	if _syncing or _current_portal == null:
+		return
+	set_portal_value(_current_portal, "bottom", float(value))
+
+func _on_st_portal_tile_changed(value):
+	if _syncing or _current_portal == null:
+		return
+	set_portal_value(_current_portal, "tile", float(value))
 
 func _on_st_portal_open_toggled(pressed):
 	if _syncing or _current_portal == null:

@@ -776,6 +776,11 @@ func get_group_caster_count(index: int) -> int:
 		return 0
 	return _groups[index]["casters"].size()
 
+func get_group_casters(index: int) -> Array:
+	if index < 0 or index >= _groups.size():
+		return []
+	return _groups[index]["casters"]
+
 func get_chain_count() -> int:
 	return _chains.size()
 
@@ -1068,7 +1073,15 @@ func _log_mask_probe(raster_imgs: Array):
 		outputlog("mask probe: no mask images readable", 0)
 		return
 
+	for img in raster_imgs:
+		img.lock()
+
 	# Coverage and widest run per slot; remember the first slot worth profiling.
+	# ALSO: the FIELD's peak height under each slot's mask. The tier histogram
+	# samples a sparse grid that steps right over thin wall strips (slot
+	# coverage 0.0% while the wall plainly casts), so this is the only readback
+	# that can answer "did the strip rasterise at its full drop height" — the
+	# decisive number for a too-short wall shadow.
 	var profile = null
 	for gi in range(_groups.size()):
 		var ci = int(gi / SLOTS_PER_CHAIN)
@@ -1078,12 +1091,14 @@ func _log_mask_probe(raster_imgs: Array):
 		var mimg = mask_imgs[ci]
 		var w = mimg.get_width()
 		var h = mimg.get_height()
+		var fimg = raster_imgs[ci] if ci < raster_imgs.size() else null
 
 		var hits = 0
 		var samples = 0
 		var best_y = -1
 		var best_run = 0
 		var best_start = -1
+		var fpeak = 0.0
 		var step = max(1, int(h / 96))
 		var y = 0
 		while y < h:
@@ -1100,13 +1115,17 @@ func _log_mask_probe(raster_imgs: Array):
 						best_run = run
 						best_y = y
 						best_start = start
+					if fimg != null:
+						var fv = _chan(fimg.get_pixel(x, y), ch) * HEIGHT_DIVISOR
+						if fv > fpeak:
+							fpeak = fv
 				else:
 					run = 0
 				samples += 1
 			y += step
-		outputlog("mask probe slot %d/layer %d: coverage %.2f%% widest run %d texels (%.0f world px) at row %d" % [
+		outputlog("mask probe slot %d/layer %d: coverage %.2f%% widest run %d texels (%.0f world px) at row %d | field peak under mask %.2f tiers" % [
 			gi, int(_groups[gi]["layer"]), 100.0 * hits / max(1, samples),
-			best_run, best_run / max(0.0001, _vp_scale), best_y], 0)
+			best_run, best_run / max(0.0001, _vp_scale), best_y, fpeak], 0)
 		if profile == null and best_run > 4:
 			profile = {"gi": gi, "ci": ci, "ch": ch, "y": best_y,
 				"run": best_run, "start": best_start, "w": w}
@@ -1122,7 +1141,6 @@ func _log_mask_probe(raster_imgs: Array):
 		var mimg = mask_imgs[ci]
 		var fimg = raster_imgs[ci] if ci < raster_imgs.size() else null
 		if fimg != null:
-			fimg.lock()
 			# Window: the run plus margin either side, 40 sample points.
 			var margin = int(max(4, best_run / 2))
 			var x0 = int(max(0, best_start - margin))
@@ -1152,8 +1170,9 @@ func _log_mask_probe(raster_imgs: Array):
 					(best_start + best_run - 1 - f_edge) / max(0.0001, _vp_scale)], 0)
 			else:
 				outputlog("  field step NOT inside the window — mask and field disagree about where this contour is", 0)
-			fimg.unlock()
 
+	for img in raster_imgs:
+		img.unlock()
 	for ci in mask_imgs.keys():
 		mask_imgs[ci].unlock()
 
