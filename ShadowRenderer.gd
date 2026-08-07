@@ -322,11 +322,13 @@ func rebuild():
 		# soft, blurred, penumbra'd edges without seams or double-darkening,
 		# while a multiplicative mask is exactly 1 at every quad edge by
 		# construction — the quad's outline is unrenderable — and blend_mul
-		# composes overlapping portals as serial transmissions. Allocated only
-		# when the group has an open portal on a Wall caster.
+		# composes overlapping portals as serial transmissions. Allocated
+		# when the group has an open portal on a wall-strip caster, or a
+		# ONE-SIDED wall (whose suppressed side is drawn black into this
+		# same mask).
 		var beam_vp = null
 		var quad_root = null
-		if _group_has_open_portals(gi):
+		if _group_needs_beam_mask(gi):
 			beam_vp = Viewport.new()
 			beam_vp.size = bake_size
 			beam_vp.usage = Viewport.USAGE_2D
@@ -830,8 +832,9 @@ func update_uniforms():
 # the same spot; different layers are separate bakes and still darken beams.
 
 func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
-	if _pattern_shader == null:
-		return
+	# NO early return on a missing pattern shader: the side-suppression meshes
+	# below are plain MUL polygons and must build regardless — only the beam
+	# quads themselves need PatternShadow.shader.
 	var sun = sun_settings.get_sun()
 	var alt = clamp(float(sun.get("altitude", 35.0)), 1.0, 89.0)
 	var tan_c = tan(deg2rad(alt))
@@ -840,7 +843,14 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 	var dirv = sun_settings.get_shadow_direction()
 	var raster_rect = height_field.get_raster_rect()
 	var d_cap = raster_rect.size.length() if raster_rect != null else 100000.0
+	# For the one-sided suppression bands: the wall's own max shadow reach at
+	# the current sun, padded by the strip half-width plus the blur smear (the
+	# outermost elevated texel sits ~2*sigma past the strip edge).
+	var blend = float(sun.get("level_blend", 2.0))
+	var texel_px = 1.0 / max(0.0001, height_field.get_vp_scale())
+	var band_margin = (2.0 * blend + 2.0) * texel_px + 8.0
 	var quads = 0
+	var sup = 0
 
 	for g in _groups:
 		var root = g.get("quad_root")
@@ -849,11 +859,15 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 		for child in root.get_children():
 			child.queue_free()
 		for caster in height_field.get_group_casters(g["slot"]):
+			if _pattern_shader == null:
+				break
 			if caster == null or not is_instance_valid(caster):
 				continue
 			var cfg = path_tagging.get_config(caster)
-			# Beams are a wall-mode concept.
-			if int(cfg.get("side", 0)) != 2:
+			# Beams are a wall-strip concept: any DD wall node (one-sided
+			# included — a Side A/B wall's doors still beam on the casting
+			# side), or a drawn path in "Wall (both)".
+			if int(cfg.get("side", 0)) != 2 and not path_tagging.is_wall_node(caster):
 				continue
 			var wall_ft = float(cfg.get("height", 1.0)) * fps
 			# Shared collection with the blocker gap cutter — includes
@@ -895,8 +909,48 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 					"h_bottom_px": h_b, "h_top_px": h_t, "h_wall_px": h_w,
 					"d0_px": d0, "d1_px": d1,
 					"has_pattern": 1.0 if pattern > 0 else 0.0})
-	if quads > 0:
-		outputlog("portal beams: %d mask quad(s) built" % quads, 1)
+
+		# ONE-SIDED WALLS: draw each suppressed region black into the same
+		# mask. blend_mul commutes, so composition with the beam quads is
+		# order-free: inside a suppressed region f is 0 whatever the beams
+		# say, everywhere else the beams are untouched.
+		for entry in height_field.get_side_suppressors(g["slot"]):
+			if entry.get("mode", "band") == "interior":
+				for mesh in entry["interior_meshes"]:
+					_add_black_mesh(root, mesh)
+					sup += 1
+				outputlog("side suppression slot %d wall %s: casts OUTSIDE only — interior erased (%d piece(s), %.1f%% of map)" % [
+					g["slot"], entry["nid"], entry["interior_meshes"].size(),
+					100.0 * float(entry["interior_area"]) / height_field.get_map_area()], 1)
+			else:
+				var reach = float(entry["h_tiers"]) * tier_px / max(0.02, tan_lo)
+				var d_sup = min(reach + float(entry["half"]) + band_margin, d_cap)
+				var built = height_field.build_suppress_band_mesh(entry, d_sup)
+				if built.has("mesh"):
+					_add_black_mesh(root, built["mesh"])
+					sup += 1
+					var side_txt = "casts INSIDE only — exterior band erased"
+					if not entry["closed"]:
+						if int(entry["cast_side"]) == 0:
+							side_txt = "casts Side A only — Side-B band erased"
+						else:
+							side_txt = "casts Side B only — Side-A band erased"
+					outputlog("side suppression slot %d wall %s: %s (D=%.0f px, ~%.1f%% of map)" % [
+						g["slot"], entry["nid"], side_txt, d_sup,
+						100.0 * float(built["area"]) / height_field.get_map_area()], 1)
+	if quads > 0 or sup > 0:
+		outputlog("portal beams: %d mask quad(s) built, %d side-suppression mesh(es)" % [quads, sup], 1)
+
+# A black MUL polygon in the beam mask: multiplies the white base (and any
+# beam quads) to 0 inside the region. Vertex colours are already black; the
+# opaque base is guaranteed by the mask viewport's white ColorRect.
+func _add_black_mesh(root, mesh):
+	var mi = MeshInstance2D.new()
+	mi.mesh = mesh
+	var mat = CanvasItemMaterial.new()
+	mat.blend_mode = CanvasItemMaterial.BLEND_MODE_MUL
+	mi.material = mat
+	root.add_child(mi)
 
 # One projected parallelogram: span a..b extruded along `dirv` from d0 to d1.
 # UVs tile the pattern across the span (u) and up the opening face (v).
@@ -940,13 +994,18 @@ func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float
 	root.add_child(mi)
 	return 1
 
-# Does this layer group contain a Wall-mode caster with at least one open
-# portal? Decides whether a beam-mask render target is worth allocating.
-func _group_has_open_portals(slot: int) -> bool:
+# Does this layer group need a beam-mask render target: a wall-strip caster
+# with at least one open portal (light beams), or a one-sided wall (side
+# suppression regions — drawn black into the same mask).
+func _group_needs_beam_mask(slot: int) -> bool:
+	if height_field.get_side_suppressors(slot).size() > 0:
+		return true
 	for caster in height_field.get_group_casters(slot):
 		if caster == null or not is_instance_valid(caster):
 			continue
-		if int(path_tagging.get_config(caster).get("side", 0)) != 2:
+		# Any WALL node is a strip caster (side 0/1 = one-sided strip); a
+		# drawn PATH is a strip only in "Wall (both)".
+		if int(path_tagging.get_config(caster).get("side", 0)) != 2 and not path_tagging.is_wall_node(caster):
 			continue
 		if height_field.get_open_wall_portals(caster).size() > 0:
 			return true

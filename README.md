@@ -27,6 +27,11 @@ altitude)`. Want drama? Lower the sun. The numbers stay honest.
   (one side uphill: Side A/B) or a **Wall** — only the path's strip is
   raised, both sides low. A closed circle of wall shades its own interior
   on the sun-facing arc: instant crater.
+- **One-sided walls.** On a Dungeondraft wall, Side A / Side B cast on ONE
+  side only: a closed house wall on Side A shades the outside world while
+  the interior stays completely lit (so indoor light sources read
+  correctly); Side B shades the inside only (courtyards). Flip the button
+  if it lands on the wrong side; **Both sides** is the classic strip.
 - **Multi-tier aware.** Nested contours stack (three 5 ft contours = a
   15 ft summit), shadows fall correctly across other tiers, and overlapping
   shadows never double-darken.
@@ -69,7 +74,7 @@ Dungeondraft 1.2.0.1.
 | Setting | What it does |
 |---|---|
 | Elevation Shadow | This path casts (and raises the terrain on its uphill side). |
-| Side A / Side B / Wall (both) | Which side is uphill — or a free-standing wall, raised only along the path with both sides low. |
+| Side A / Side B / Wall (both) | Paths: which side is uphill — or a free-standing wall strip. Walls: which side the shadow falls on (A/B = one side only, Both sides = classic strip). |
 | Drop height (ft) | How far the ground drops. Drives shadow length physically. |
 | Art above shadow | The path's artwork draws over its own layer's shadow, so the texture's real edge hides where the shadow starts. On by default for casters. |
 | Shadow inset | Fine-tune (in px) how far the shadow tucks under the art's edge. |

@@ -101,6 +101,15 @@ var _mask_chains = []
 # stops when a sun-ray crosses it, so occluders beyond never darken the near
 # side. {"vp":Viewport, "root":Node2D} or null.
 var _blocker = null
+# ONE-SIDED WALLS: per slot, the regions where this group's shadow must be
+# ERASED so a wall casts on one side only. Rebuilt with the field; consumed by
+# ShadowRenderer, which draws them black into the group's beam mask (the march
+# multiplies its output by the mask, so the casting side's penumbra survives
+# untouched while the suppressed side is exactly clean).
+# slot -> [entry], entry keys: nid, cast_side (0/1), closed, mode
+# ("interior"|"band"), pts, half, h_tiers, interior_meshes, interior_area,
+# outward_sign (band mode only). See _register_side_suppressor for semantics.
+var _side_suppress = {}
 var _smooth_shader = null
 var _mask_shader = null
 var _debug_sprites = []
@@ -273,7 +282,14 @@ func _uphill_sample_points(pts: PoolVector2Array, side: int) -> Array:
 # hole from each half; the results are simple polygons. Open paths whose round
 # end caps overlap (a circle drawn without closing the loop) produce the same
 # ring-with-hole shape, so this handles them identically.
-func _path_strip_polygons(path, inset: float, cut_portals: bool = true) -> Array:
+#
+# `ring_out`: pass a Dictionary to receive the strip's byproducts —
+#   "holes": the CW ring-hole polygons (the ground a closed wall encloses),
+#   "half":  the final strip half-width in world px (after inset + blur floor).
+# The one-sided-wall suppression needs both: the holes ARE the interior region,
+# and the half-width pads the suppression band. Callers that don't care pass
+# nothing.
+func _path_strip_polygons(path, inset: float, cut_portals: bool = true, ring_out = null) -> Array:
 	var pts = _world_points(path)
 	if pts.size() < 2:
 		return []
@@ -315,10 +331,15 @@ func _path_strip_polygons(path, inset: float, cut_portals: bool = true) -> Array
 		else:
 			solids.append(p)
 
+	if ring_out is Dictionary:
+		ring_out["holes"] = holes
+		ring_out["half"] = half
+
 	solids = _subtract_holes(solids, holes)
 
-	# Portal gaps are cut ONLY for the BLOCKER raster (and only for Wall-mode
-	# casters — in Side A/B portals must have zero effect). The ELEVATION
+	# Portal gaps are cut ONLY for the BLOCKER raster (and only for wall-strip
+	# casters: wall nodes on any side, paths in Wall mode — on a Side A/B
+	# PATH portals must have zero effect). The ELEVATION
 	# strip stays SOLID across open portals: the march bakes the full wall
 	# shadow and ShadowRenderer's multiplicative beam masks carve the
 	# opening's light out of the BAKE. Cutting the elevation instead (the
@@ -413,6 +434,209 @@ func _dist_to_polyline(pts: PoolVector2Array, p: Vector2) -> float:
 		if d < best:
 			best = d
 	return best
+
+#########################################################################################################
+## ONE-SIDED WALLS — side suppression regions
+#########################################################################################################
+# A wall node on Side A/B casts on ONE side only. The elevation strip cannot
+# express that (a raised strip shades whichever side faces away from the sun),
+# so the OFF side is erased from the BAKE instead: these regions are drawn
+# BLACK into the group's beam-mask viewport (ShadowRenderer), and the march
+# multiplies its output by the mask. The casting side keeps its full soft
+# penumbra (mask = 1 there); the suppressed side is exactly clean; the hard
+# mask edge sits on the wall centerline / strip edge, hidden under the art.
+#
+# Region semantics:
+#   * CLOSED wall — the strip ring encloses ground (detected by the ring
+#     HOLES, which also catches a circle drawn without closing the loop):
+#       Side A = casts OUTSIDE. The WHOLE interior is suppressed — the lit-
+#         house case: nothing from this layer may darken the floor plan, other
+#         same-layer walls' spill included ("the interior stays clean").
+#       Side B = casts INSIDE (courtyard/crater). The exterior is suppressed
+#         as a BAND around the wall, not the whole map — see below.
+#   * OPEN wall — Side A/B name the same geometric side a contour's Side A/B
+#     shadow falls on (pts are canonicalised by Core.orient_points; Side A =
+#     the (-dy,dx) side). The OPPOSITE side is suppressed as a BAND. The
+#     contour closure machinery is NOT reused here: for a straight interior
+#     wall its chord closure degenerates to a zero-area sliver vs the whole
+#     map, and "whole map" would suppress the casting side too.
+#
+# Why a BAND and not the whole half-region: the mask multiplies the ENTIRE
+# layer group's bake, so black also erases OTHER same-layer casters' shadow
+# there (all walls share layer 600). Desired inside a closed interior;
+# disastrous map-wide (one Side-B house would erase every other building's
+# shadow on the whole exterior). The band is sized in ShadowRenderer to THIS
+# wall's maximum shadow reach at the current sun (h/tan_lo + strip + blur
+# margin, rebuilt with the uniforms so altitude changes track live) — exactly
+# the area this wall could ever shade, so collateral is minimal. Accepted
+# limit: another same-layer shadow crossing the band's outer edge shows a
+# hard cut there.
+#
+# Accepted limit (degenerate): a wall that self-encloses only partially (a
+# lasso — hole plus an open tail) is treated as closed, so the tail casts on
+# both sides.
+
+func _register_side_suppressor(slot: int, path, side: int, ring: Dictionary, height_tiers: float):
+	var pts = _world_points(path)
+	if pts.size() < 2:
+		return
+	var holes = ring.get("holes", [])
+	var closed = holes.size() > 0
+	var nid = str(core.get_node_id(path))
+	var entry = {
+		"nid": nid,
+		"cast_side": side,
+		"closed": closed,
+		"mode": "band",
+		"pts": pts,
+		"half": float(ring.get("half", 32.0)),
+		"h_tiers": height_tiers,
+		"interior_meshes": [],
+		"interior_area": 0.0,
+	}
+	if closed and side == 0:
+		entry["mode"] = "interior"
+		for hole in holes:
+			# Clipper holes are CW; reverse so triangulation/cleaning treats
+			# them as solids.
+			var ccw = PoolVector2Array(hole)
+			ccw.invert()
+			var mesh = _make_polygon_mesh(ccw, Color(0, 0, 0, 1))
+			if mesh != null:
+				entry["interior_meshes"].append(mesh)
+				entry["interior_area"] += abs(_poly_area(hole))
+		if entry["interior_meshes"].size() == 0:
+			outputlog("  slot %d wall %s: one-sided but no interior mesh could be built — casting BOTH sides" % [
+				slot, nid], 0)
+			return
+		outputlog("  slot %d wall %s one-sided (Side A = casts OUTSIDE): interior suppressed, %d piece(s), area=%.1f%% of map" % [
+			slot, nid, entry["interior_meshes"].size(),
+			100.0 * entry["interior_area"] / _map_area()], 0)
+	elif closed:
+		# Outward per-segment normal: for our shoelace convention a POSITIVE
+		# signed area means n = (-dy,dx) points INTO the loop (verified with a
+		# y-down unit square), so outward is its negation.
+		entry["outward_sign"] = -1.0 if _poly_area(pts) > 0.0 else 1.0
+		outputlog("  slot %d wall %s one-sided (Side B = casts INSIDE): exterior band suppressed (sized by sun — see [Render] side suppression)" % [
+			slot, nid], 0)
+	else:
+		# Open wall: contour convention — Side A's shadow side is (-dy,dx), so
+		# suppress the other side (sign -1); Side B mirrors.
+		entry["outward_sign"] = -1.0 if side == 0 else 1.0
+		outputlog("  slot %d wall %s one-sided (casts %s only): opposite band suppressed (sized by sun — see [Render] side suppression)" % [
+			slot, nid, "Side A" if side == 0 else "Side B"], 0)
+	if not _side_suppress.has(slot):
+		_side_suppress[slot] = []
+	_side_suppress[slot].append(entry)
+
+# The suppression entries of one layer group (empty array when none).
+func get_side_suppressors(slot: int) -> Array:
+	return _side_suppress.get(slot, [])
+
+func get_map_area() -> float:
+	return _map_area()
+
+# The suppression BAND for one entry: every point within `dist` of the wall
+# centerline on the suppressed side, as raw triangles (per-segment swept
+# rectangles + joint fans + end extensions past open tips, so the round end
+# caps' wrap-around shadow dies too). Overlap between triangles is harmless —
+# they render BLACK into a multiplicative mask, and 0*0 = 0 — which is what
+# makes this robust with zero Clipper work: no unions, no self-intersection
+# cleanup, no hole subtraction. Returns {"mesh": ArrayMesh, "area": float}
+# (area sums the triangles, so overlaps double-count — logged with a ~).
+func build_suppress_band_mesh(entry: Dictionary, dist: float) -> Dictionary:
+	var pts: PoolVector2Array = entry["pts"]
+	var nsign = float(entry.get("outward_sign", 1.0))
+	var closed = bool(entry["closed"])
+	var n_pts = pts.size()
+	if n_pts < 2:
+		return {}
+	var segs = []
+	var seg_count = n_pts if closed else n_pts - 1
+	for i in range(seg_count):
+		var a = pts[i]
+		var b = pts[(i + 1) % n_pts]
+		var dvec = b - a
+		if dvec.length() < 0.5:
+			continue
+		var dirn = dvec.normalized()
+		segs.append({"a": a, "b": b, "t": dirn,
+			"n": Vector2(-dirn.y, dirn.x) * nsign})
+	if segs.size() == 0:
+		return {}
+
+	# Plain Array accumulator: PoolVector2Array is copy-on-write across calls,
+	# so appending inside helpers would not reach the caller.
+	var tris = []
+	for s in segs:
+		var far_a = s["a"] + s["n"] * dist
+		var far_b = s["b"] + s["n"] * dist
+		_band_tri(tris, s["a"], s["b"], far_b)
+		_band_tri(tris, s["a"], far_b, far_a)
+	# Joint fans fill the wedge gap where consecutive segments turn away from
+	# the band (and overlap harmlessly where they turn into it).
+	var wedge_count = segs.size() if closed else segs.size() - 1
+	for i in range(wedge_count):
+		var s0 = segs[i]
+		var s1 = segs[(i + 1) % segs.size()]
+		_band_fan(tris, s1["a"], s0["n"], s1["n"], dist)
+	if not closed:
+		# Extend past the tips so the end caps' radial shadow is covered on
+		# the suppressed side (the casting side's wrap-around survives).
+		var first = segs[0]
+		var back = first["a"] - first["t"] * dist
+		_band_tri(tris, first["a"], back, back + first["n"] * dist)
+		_band_tri(tris, first["a"], back + first["n"] * dist, first["a"] + first["n"] * dist)
+		var last = segs[segs.size() - 1]
+		var fwd = last["b"] + last["t"] * dist
+		_band_tri(tris, last["b"], fwd, fwd + last["n"] * dist)
+		_band_tri(tris, last["b"], fwd + last["n"] * dist, last["b"] + last["n"] * dist)
+
+	var verts = PoolVector2Array()
+	var colors = PoolColorArray()
+	var black = Color(0, 0, 0, 1)
+	var area = 0.0
+	var i = 0
+	while i < tris.size():
+		var pa = tris[i]
+		var pb = tris[i + 1]
+		var pc = tris[i + 2]
+		area += abs((pb - pa).cross(pc - pa)) * 0.5
+		verts.append(pa)
+		verts.append(pb)
+		verts.append(pc)
+		colors.append(black)
+		colors.append(black)
+		colors.append(black)
+		i += 3
+
+	var arrays = []
+	arrays.resize(ArrayMesh.ARRAY_MAX)
+	arrays[ArrayMesh.ARRAY_VERTEX] = verts
+	arrays[ArrayMesh.ARRAY_COLOR] = colors
+	var mesh = ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return {"mesh": mesh, "area": area}
+
+func _band_tri(tris: Array, a: Vector2, b: Vector2, c: Vector2):
+	tris.append(a)
+	tris.append(b)
+	tris.append(c)
+
+# Fan of triangles sweeping from normal n0 to n1 around `pivot`, radius
+# padded so the fan's straight CHORDS never dip inside `dist` (the chord of a
+# 0.6 rad step sags ~4.5%, which would eat the band's safety margin under a
+# tall wall).
+func _band_fan(tris: Array, pivot: Vector2, n0: Vector2, n1: Vector2, dist: float):
+	var ang = n0.angle_to(n1)
+	if abs(ang) < 0.01:
+		return
+	var steps = int(max(1, ceil(abs(ang) / 0.6)))
+	var r = dist / cos(abs(ang) / float(steps) * 0.5)
+	for k in range(steps):
+		var a0 = n0.rotated(ang * float(k) / float(steps)).normalized()
+		var a1 = n0.rotated(ang * float(k + 1) / float(steps)).normalized()
+		_band_tri(tris, pivot, pivot + a0 * r, pivot + a1 * r)
 
 # Subtract CW hole polygons from CCW solids, producing simple (triangulable)
 # pieces: each hole splits every piece vertically through the hole's centre,
@@ -934,24 +1158,31 @@ func rebuild():
 			var cfg = path_tagging.get_config(path)
 			var height = float(cfg.get("height", 1.0))
 			var side = int(cfg.get("side", 0))
+			var is_wall = path_tagging.is_wall_node(path)
 
-			# Side A/B: a terrain step — one side is uphill, filled to the map
-			# edge (or the closure). "Wall (both)": a FREE-STANDING WALL — only
-			# the path's own strip is raised, both sides stay low, so shadows
-			# fall away from the sun on either side. A closed circle of wall
-			# shades its own interior on the sunward arc: a crater rim.
+			# PATHS — Side A/B: a terrain step, one side uphill, filled to the
+			# map edge (or the closure); "Wall (both)": a FREE-STANDING WALL
+			# strip, both sides low. WALL NODES are ALWAYS a strip (a wall on
+			# side 0/1 used to fall into the contour fill and silently cover
+			# half the map); for them side 0/1 means CAST ON ONE SIDE ONLY —
+			# the strip still rasterises identically (elevation is a scalar
+			# and cannot be one-sided) and the un-cast side is erased from the
+			# bake via the group's beam mask (_register_side_suppressor).
 			var polys
-			if side == 2:
+			var ring = {}
+			if is_wall or side == 2:
 				# cut_portals=false: the elevation stays SOLID across open
 				# portals — beams are carved out of the bake by the beam
 				# masks, not out of the field (the blocker still gaps, so
 				# other casters' shadows pass through open doors).
-				polys = _path_strip_polygons(path, float(cfg.get("mask_inset", 5.0)), false)
+				polys = _path_strip_polygons(path, float(cfg.get("mask_inset", 5.0)), false, ring)
 			else:
 				polys = _contour_to_polygons(path, side)
 			if polys.size() == 0:
 				skipped += 1
 				continue
+			if is_wall and side != 2:
+				_register_side_suppressor(gi, path, side, ring, height)
 
 			# The elevation step sits ON the drawn centreline — deliberately not
 			# pulled back from it (the removed `edge_inset_mult` approach): the
@@ -1420,10 +1651,11 @@ func _build_blockers(vp_size: Vector2):
 		# Full width (inset 0): a blocker should stop shadows at the wall's
 		# footprint, and a slightly generous edge also guards against the
 		# march's growing stride stepping over a thin strip.
-		# Portal gaps only when the caster itself is in Wall mode — in Side A/B
-		# the path is a terrain step and portals must not touch the blocker
-		# either (see _path_strip_polygons).
-		var gaps = int(path_tagging.get_config(node).get("side", 0)) == 2
+		# Portal gaps for every WALL node (one-sided walls included — their
+		# strip still has doors) and for paths in Wall mode. A path on Side
+		# A/B is a terrain step and portals must not touch the blocker
+		# (see _path_strip_polygons).
+		var gaps = path_tagging.is_wall_node(node) or int(path_tagging.get_config(node).get("side", 0)) == 2
 		for poly in _path_strip_polygons(node, 0.0, gaps):
 			var mesh = _make_polygon_mesh(poly, Color(1, 1, 1, 1))
 			if mesh == null:
@@ -1562,6 +1794,7 @@ func _teardown_viewport():
 	_mask_chains = []
 	_blocker = null
 	_groups = []
+	_side_suppress = {}
 	_viewport_count = 0
 
 #########################################################################################################

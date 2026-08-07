@@ -31,7 +31,17 @@ const FIELD_KEYS = ["enabled", "side", "height", "art_above", "mask_inset", "blo
 
 const CASTER_DEFAULTS = {
 	"enabled": false,
-	"side": 0,        # 0 = Side A, 1 = Side B, 2 = Wall (free-standing, both sides low)
+	# For PATHS (Line2D): 0 = Side A, 1 = Side B (terrain contour — which side
+	# is uphill), 2 = Wall (free-standing strip, both sides low).
+	# For WALL nodes (Joint != null): the wall is ALWAYS a strip (contour fills
+	# are meaningless for walls — a wall on side 0/1 used to silently fill half
+	# the map as terrain, which is exactly the confusion this replaces), and
+	# the value picks the CAST side instead: 0 = shadow on Side A only,
+	# 1 = Side B only, 2 = both sides. One-sided walls keep the un-cast side
+	# completely clean (a closed house wall on Side A shades the outside world
+	# while its interior stays fully lit, so DD's indoor lights work). Which
+	# side is "A" is arbitrary per wall — flip the button if it's wrong.
+	"side": 0,
 	# Elevation drop in TIERS (grid squares of height) — the internal unit the
 	# field and the march work in, and what old maps already store. The UI
 	# converts to/from FEET via feet_per_square (5 ft/square by default), so a
@@ -73,6 +83,31 @@ const CASTER_DEFAULTS = {
 }
 
 const SIDE_NAMES = ["Side A", "Side B", "Wall (both)"]
+# Wall nodes reuse the same stored `side` value but read it as the CAST side
+# (see CASTER_DEFAULTS), so the button shows wall-flavoured labels for them.
+const WALL_SIDE_NAMES = ["Side A", "Side B", "Both sides"]
+
+const PATH_SIDE_TOOLTIP = ("Which side of the contour is uphill.\n" +
+	"Wall (both): a free-standing wall - only the path itself is raised,\n" +
+	"both sides stay low. A closed circle of wall shades its inside\n" +
+	"on the sun-facing arc, like a crater rim.")
+const WALL_SIDE_TOOLTIP = ("Which side of the wall the shadow falls on - flip if it's\n" +
+	"the wrong one. Side A / Side B cast on ONE side only: on a\n" +
+	"closed wall, Side A shades the outside and keeps the interior\n" +
+	"fully lit (so indoor lights work), Side B shades the inside\n" +
+	"(courtyard/crater). Both sides: the classic free-standing wall.")
+
+# A DD wall node (WallTool): Node2D with a C# Joint property. Paths are Line2D.
+func is_wall_node(node) -> bool:
+	if node == null or not is_instance_valid(node):
+		return false
+	return node.get("Joint") != null
+
+# Button label for the side value, per node kind.
+func side_label(node, side: int) -> String:
+	if is_wall_node(node):
+		return WALL_SIDE_NAMES[side % 3]
+	return SIDE_NAMES[side % 3]
 
 # Per-portal light-opening settings (portal store, keyed by node_id, alongside
 # "open"). All in FEET. The opening is a vertical band in the wall's face from
@@ -524,10 +559,7 @@ func _build_path_tool_ui():
 
 	var side_btn = Button.new()
 	side_btn.text = SIDE_NAMES[0]
-	side_btn.hint_tooltip = ("Which side of the contour is uphill.\n" +
-		"Wall (both): a free-standing wall - only the path itself is raised,\n" +
-		"both sides stay low. A closed circle of wall shades its inside\n" +
-		"on the sun-facing arc, like a crater rim.")
+	side_btn.hint_tooltip = PATH_SIDE_TOOLTIP
 	side_btn.connect("pressed", self, "_on_pt_side_pressed")
 	container.add_child(side_btn)
 	pt_ui["side"] = side_btn
@@ -565,10 +597,9 @@ func _build_select_tool_ui():
 
 	var side_btn = Button.new()
 	side_btn.text = SIDE_NAMES[0]
-	side_btn.hint_tooltip = ("Which side of the contour is uphill.\n" +
-		"Wall (both): a free-standing wall - only the path itself is raised,\n" +
-		"both sides stay low. A closed circle of wall shades its inside\n" +
-		"on the sun-facing arc, like a crater rim.")
+	# Label and tooltip are re-targeted per selection (walls read the same
+	# value as the CAST side) — see on_selection_changed.
+	side_btn.hint_tooltip = PATH_SIDE_TOOLTIP
 	side_btn.connect("pressed", self, "_on_st_side_pressed")
 	container.add_child(side_btn)
 	st_ui["side"] = side_btn
@@ -823,7 +854,8 @@ func on_selection_changed():
 	var h_ft = float(cfg.get("height", 1.0)) * _feet_per_square()
 	_syncing = true
 	st_ui["enabled"].pressed = cfg.get("enabled", false)
-	st_ui["side"].text = SIDE_NAMES[int(cfg.get("side", 0))]
+	st_ui["side"].text = side_label(path, int(cfg.get("side", 0)))
+	st_ui["side"].hint_tooltip = WALL_SIDE_TOOLTIP if is_wall_node(path) else PATH_SIDE_TOOLTIP
 	st_ui["height_slider"].value = h_ft
 	st_ui["height_spin"].value = h_ft
 	if st_ui.has("art_above"):
@@ -847,7 +879,7 @@ func _on_st_side_pressed():
 	var cfg = get_config(_current_path)
 	var next_side = (int(cfg.get("side", 0)) + 1) % 3
 	set_config_value(_current_path, "side", next_side)
-	st_ui["side"].text = SIDE_NAMES[next_side]
+	st_ui["side"].text = side_label(_current_path, next_side)
 
 func _feet_per_square() -> float:
 	if sun_settings != null and sun_settings.has_method("get_feet_per_square"):
