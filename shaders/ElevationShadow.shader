@@ -95,6 +95,20 @@ uniform int mask_channel = 0;
 uniform sampler2D blocker_tex;
 uniform float use_blocker = 0.0;
 
+// PORTAL BEAM MASKS — light through wall openings, baked by ShadowRenderer
+// into a white-based, multiplicatively-composed mask (red channel):
+// f = fraction of the SOLID wall's shadow surviving at this pixel. 1 outside
+// every beam and on opaque pattern bars; -> 0 where an opening passes light.
+//   beam_own   : this group's mask. Carves the beams out of our own bake.
+//   beam_above : the beam-carrying higher group's mask. Scales the `above`
+//                subtraction, so shadow this layer deferred to a higher wall
+//                reappears exactly where that wall's shadow was carved away
+//                (other layers' shadows through open doors).
+uniform sampler2D beam_own;
+uniform float use_beam_own = 0.0;
+uniform sampler2D beam_above;
+uniform float use_beam_above = 0.0;
+
 const int MAX_STEPS = 512;
 
 // The sampler MUST be passed in. Godot's shader language only exposes built-ins
@@ -118,6 +132,13 @@ void fragment() {
 	vec3 a0 = slots_at(TEXTURE, UV);
 	vec3 b0 = slots_at(field_b, UV) * use_field_b;
 	float h0 = sum6(a0, b0);
+
+	// Beam masks are functions of the shaded pixel, not of the march position:
+	// one fetch each, before the loop. above_scale must also feed the early
+	// exit — breaking on `mine <= above` with the unscaled `above` would stop
+	// growing `mine` and under-darken shadow pouring through an open door.
+	float own_scale = use_beam_own > 0.5 ? clamp(texture(beam_own, UV).r, 0.0, 1.0) : 1.0;
+	float above_scale = use_beam_above > 0.5 ? clamp(texture(beam_above, UV).r, 0.0, 1.0) : 1.0;
 
 	float mine = 0.0;       // strongest shadow owned by this slot
 	float above = 0.0;      // strongest shadow owned by a higher slot
@@ -168,7 +189,7 @@ void fragment() {
 			if (has_above < 0.5) {
 				break;
 			}
-			if (mine <= above) {
+			if (mine <= above * above_scale) {
 				break;
 			}
 			if (cap <= max(tan_lo, mt_above)) {
@@ -263,7 +284,13 @@ void fragment() {
 	// telescopes to max(all slots): the ground darkens once however many layers
 	// overlap it, while a layer's own artwork (which hides the sprites below it)
 	// still receives everything from above.
-	float strength = clamp((mine - above) / max(0.0001, 1.0 - above), 0.0, 1.0);
+	float ab = above * above_scale;
+	float strength = clamp((mine - ab) / max(0.0001, 1.0 - ab), 0.0, 1.0);
+
+	// Carve this layer's own portal beams out of its shadow. Multiplicative,
+	// so the march's soft edges survive everywhere the mask is 1 — which is
+	// everywhere except strictly inside a beam.
+	strength *= own_scale;
 
 	// Hide the shadow under this layer's own flagged artwork. Sampled in the same
 	// normalised space as the field (the mask raster shares the raster rect).

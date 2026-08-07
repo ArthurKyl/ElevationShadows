@@ -317,11 +317,14 @@ func _path_strip_polygons(path, inset: float, cut_portals: bool = true) -> Array
 
 	solids = _subtract_holes(solids, holes)
 
-	# Portal gaps are a WALL-mode concept. The elevation strip only exists in
-	# wall mode, but the BLOCKER raster calls this for Side A/B casters too —
-	# there the path is a terrain step, portals must have zero effect, and
-	# cutting gaps anyway let the taller up-sun terrain's shadow spill through
-	# open doors ("the wall's shadow doubles at open portals" in Side mode).
+	# Portal gaps are cut ONLY for the BLOCKER raster (and only for Wall-mode
+	# casters — in Side A/B portals must have zero effect). The ELEVATION
+	# strip stays SOLID across open portals: the march bakes the full wall
+	# shadow and ShadowRenderer's multiplicative beam masks carve the
+	# opening's light out of the BAKE. Cutting the elevation instead (the
+	# first scheme) left a soft-edged light corridor that additively-rebuilt
+	# quads could never meet without seams or double-darkening — the bake
+	# measured red at 1.00 when the march can emit at most `opacity`.
 	if cut_portals:
 		solids = _cut_open_portals(path, solids, half)
 
@@ -341,14 +344,20 @@ func _path_strip_polygons(path, inset: float, cut_portals: bool = true) -> Array
 # the wall (global_position ± direction * radius, verified in the assembly).
 # The cut rectangle overhangs the strip on both sides, so it always bisects a
 # piece rather than punching a hole (which could not be triangulated).
-func _cut_open_portals(path, solids: Array, half: float) -> Array:
-	# Via PathTagging.get_wall_portals — Wall.Portals itself is a C# List<T>
-	# that Godot's bridge cannot marshal (get() returns null, silently).
-	var portals = path_tagging.get_wall_portals(path, true)
+# The OPEN portals of a wall: WallID children plus proximity-adopted
+# freestanding ones, filtered through PathTagging.is_portal_open (the mod's
+# "Open for sunlight" toggle, falling back to DD's Closed flag). ONE
+# collection shared by the blocker gap cutter and ShadowRenderer's beam-mask
+# builder, so blocker gaps and light beams can never disagree about which
+# doors exist (the earlier split meant an unsnapped door got a gap but no
+# beam). Via PathTagging.get_wall_portals — Wall.Portals itself is a C#
+# List<T> that Godot's bridge cannot marshal (get() returns null, silently).
+func get_open_wall_portals(path, half: float = 64.0) -> Array:
+	var portals = path_tagging.get_wall_portals(path, false)
 	# Portals without a living WallID (freestanding, or their wall was
 	# redrawn) are adopted by proximity: DD only writes WallID when the portal
 	# snapped onto the wall at placement, and a door dropped onto the art
-	# without snapping should still make a gap.
+	# without snapping should still let light through.
 	var pts = _world_points(path)
 	if pts.size() >= 2:
 		for portal in path_tagging.get_unattached_portals():
@@ -358,15 +367,21 @@ func _cut_open_portals(path, solids: Array, half: float) -> Array:
 			if dist <= reach:
 				portals.append(portal)
 				outputlog("path %s: unattached portal adopted by proximity (%.0f px from wall line)" % [
-					str(core.get_node_id(path)), dist], 0)
-	var cut = 0
+					str(core.get_node_id(path)), dist], 1)
+	var out = []
 	for portal in portals:
 		if portal == null or not is_instance_valid(portal):
 			continue
-		# Effective state: the mod's per-portal "Open for sunlight" toggle,
-		# falling back to DD's Portal.Closed flag.
-		if not path_tagging.is_portal_open(portal):
-			continue
+		if path_tagging.is_portal_open(portal):
+			out.append(portal)
+	return out
+
+# Cut each open portal's span out of the BLOCKER strip, so outside shadows
+# spill through open doors ("Stops outside shadows" must not stop them at a
+# doorway).
+func _cut_open_portals(path, solids: Array, half: float) -> Array:
+	var cut = 0
+	for portal in get_open_wall_portals(path, half):
 		var a = portal.get("Begin")
 		var b = portal.get("End")
 		if not (a is Vector2 and b is Vector2):
@@ -385,11 +400,8 @@ func _cut_open_portals(path, solids: Array, half: float) -> Array:
 		solids = next
 		cut += 1
 	if cut > 0:
-		outputlog("path %s: %d open portal(s) let light through the wall strip" % [
+		outputlog("path %s: %d open portal(s) cut from the blocker strip" % [
 			str(core.get_node_id(path)), cut], 0)
-	elif portals.size() > 0:
-		outputlog("path %s: %d portal(s) on this wall, NONE open for sunlight -> no gaps" % [
-			str(core.get_node_id(path)), portals.size()], 0)
 	return solids
 
 # Shortest distance from a point to any segment of a polyline.
@@ -930,7 +942,11 @@ func rebuild():
 			# shades its own interior on the sunward arc: a crater rim.
 			var polys
 			if side == 2:
-				polys = _path_strip_polygons(path, float(cfg.get("mask_inset", 5.0)))
+				# cut_portals=false: the elevation stays SOLID across open
+				# portals — beams are carved out of the bake by the beam
+				# masks, not out of the field (the blocker still gaps, so
+				# other casters' shadows pass through open doors).
+				polys = _path_strip_polygons(path, float(cfg.get("mask_inset", 5.0)), false)
 			else:
 				polys = _contour_to_polygons(path, side)
 			if polys.size() == 0:

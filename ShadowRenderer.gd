@@ -217,6 +217,11 @@ func clear():
 			if vp.get_parent() != null:
 				vp.get_parent().remove_child(vp)
 			vp.queue_free()
+		var bvp = g.get("beam_vp")
+		if bvp != null and is_instance_valid(bvp):
+			if bvp.get_parent() != null:
+				bvp.get_parent().remove_child(bvp)
+			bvp.queue_free()
 	_groups = []
 
 func rebuild():
@@ -307,16 +312,44 @@ func rebuild():
 		bake_sprite.scale = Vector2(bake_scale, bake_scale)
 		bake_sprite.material = material
 		bake_vp.add_child(bake_sprite)
-		# Portal beam/pattern quads render into the same bake, ON TOP of the
-		# march (additive into red). The root maps world px -> bake px so the
-		# projector can think in world coordinates.
-		var quad_root = Node2D.new()
-		var qs = vp_scale * bake_scale
-		quad_root.scale = Vector2(qs, qs)
-		quad_root.position = -raster_rect.position * qs
-		bake_vp.add_child(quad_root)
 		# A Viewport is not a CanvasItem, so parking it here does not draw into the map.
 		global.Editor.add_child(bake_vp)
+
+		# --- Beam mask: light through this layer's wall openings. ---
+		# A separate white-based render target the march MULTIPLIES its own
+		# strength by (and every LOWER pass scales its `above` term by). Not
+		# quads in the bake: quads rendered there can never meet the march's
+		# soft, blurred, penumbra'd edges without seams or double-darkening,
+		# while a multiplicative mask is exactly 1 at every quad edge by
+		# construction — the quad's outline is unrenderable — and blend_mul
+		# composes overlapping portals as serial transmissions. Allocated only
+		# when the group has an open portal on a Wall caster.
+		var beam_vp = null
+		var quad_root = null
+		if _group_has_open_portals(gi):
+			beam_vp = Viewport.new()
+			beam_vp.size = bake_size
+			beam_vp.usage = Viewport.USAGE_2D
+			beam_vp.transparent_bg = true
+			beam_vp.disable_3d = true
+			beam_vp.render_target_v_flip = true
+			beam_vp.render_target_update_mode = Viewport.UPDATE_ALWAYS
+			# White base FIRST (MIX): "no beam anywhere", and it sets dst
+			# alpha to 1 — a transparent target clears to (0,0,0,0) and MUL
+			# against alpha 0 would zero every quad's contribution.
+			var base = ColorRect.new()
+			base.color = Color(1, 1, 1, 1)
+			base.rect_position = Vector2.ZERO
+			base.rect_size = bake_size
+			beam_vp.add_child(base)
+			# The quad root maps world px -> mask px so the projector can
+			# think in world coordinates.
+			quad_root = Node2D.new()
+			var qs = vp_scale * bake_scale
+			quad_root.scale = Vector2(qs, qs)
+			quad_root.position = -raster_rect.position * qs
+			beam_vp.add_child(quad_root)
+			global.Editor.add_child(beam_vp)
 
 		# --- Visible node: a ghost Prop in Level.Objects displaying the bake. ---
 		var baked = bake_vp.get_texture()
@@ -368,6 +401,7 @@ func rebuild():
 			"z": int(layer),
 			"bake_vp": bake_vp,
 			"bake_sprite": bake_sprite,
+			"beam_vp": beam_vp,
 			"quad_root": quad_root,
 			"material": material,
 			"prop": prop,
@@ -468,6 +502,8 @@ func _thaw_bake():
 	for g in _groups:
 		if g["bake_vp"] != null and is_instance_valid(g["bake_vp"]):
 			g["bake_vp"].render_target_update_mode = Viewport.UPDATE_ALWAYS
+		if g.get("beam_vp") != null and is_instance_valid(g["beam_vp"]):
+			g["beam_vp"].render_target_update_mode = Viewport.UPDATE_ALWAYS
 	if _groups.size() == 0:
 		return
 	if _freeze_timer == null or not is_instance_valid(_freeze_timer):
@@ -488,6 +524,8 @@ func _freeze_bake():
 		if g["bake_vp"] != null and is_instance_valid(g["bake_vp"]):
 			# DISABLED keeps the last rendered frame; it does not clear the target.
 			g["bake_vp"].render_target_update_mode = Viewport.UPDATE_DISABLED
+		if g.get("beam_vp") != null and is_instance_valid(g["beam_vp"]):
+			g["beam_vp"].render_target_update_mode = Viewport.UPDATE_DISABLED
 	outputlog("%d bake(s) frozen" % _groups.size(), 1)
 
 # Read one group's baked shadow back and histogram its strength.
@@ -730,10 +768,35 @@ func update_uniforms():
 		m.set_shader_param("blocker_tex", blocker_tex if blocker_tex != null else tex_a)
 		m.set_shader_param("use_blocker", 1.0 if blocker_tex != null else 0.0)
 
-	# The projected portal quads depend on the sun (direction, altitude) and
-	# opacity, so they are rebuilt with every uniform change — a handful of
-	# small meshes, cheap next to the march.
-	_rebuild_pattern_quads()
+		# Portal beam masks. Our own carves this layer's beams out of its
+		# bake; the beam-carrying group above us rescales `above`, so shadow
+		# this layer deferred to a higher wall reappears exactly where that
+		# wall's shadow was carved away (shadows through open doors landing
+		# on lower layers). `above` is a single max across all higher slots,
+		# so if more than one higher group carries beams only the highest
+		# mask is honoured — logged; walls normally all share layer 600.
+		var beam_own_tex = _beam_texture(g["slot"])
+		m.set_shader_param("beam_own", beam_own_tex if beam_own_tex != null else tex_a)
+		m.set_shader_param("use_beam_own", 1.0 if beam_own_tex != null else 0.0)
+		var beam_above_tex = null
+		var beam_above_count = 0
+		for other in _groups:
+			if other["slot"] > g["slot"]:
+				var t = _beam_texture(other["slot"])
+				if t != null:
+					beam_above_tex = t
+					beam_above_count += 1
+		if beam_above_count > 1:
+			outputlog("WARNING: %d higher groups carry beam masks; slot %d honours only the highest" % [
+				beam_above_count, g["slot"]], 0)
+		m.set_shader_param("beam_above", beam_above_tex if beam_above_tex != null else tex_a)
+		m.set_shader_param("use_beam_above", 1.0 if beam_above_tex != null else 0.0)
+
+	# The beam-mask quads depend on the sun (direction, altitude, softness),
+	# so they are rebuilt with every uniform change — a handful of small
+	# meshes, cheap next to the march. They do NOT depend on opacity: the
+	# mask is RELATIVE to whatever the march baked, so Strength tracks free.
+	_rebuild_pattern_quads(tan_lo, tan_hi)
 
 	# Re-run the bakes with the new parameters. Without this the visible sprites
 	# keep showing the previous march.
@@ -745,35 +808,38 @@ func update_uniforms():
 		float(sun.get("opacity", 0.55)), self_bias, attr_bias, str(have_b)], 1)
 
 #########################################################################################################
-## PORTAL BEAM / PATTERN PROJECTION
+## PORTAL LIGHT BEAMS — a multiplicative mask over the SOLID wall's shadow
 #########################################################################################################
-# An open portal is a vertical BAND in the wall's face (sill `bottom` to lintel
-# `top`, in ft), optionally shaped by a pattern. Its effect on the ground
-# projects as skewed parallelograms along the shadow direction — computed here
-# at bake time, so the march never has to know:
-#
-#   d(x ft) = (x/fps) * tier_px / tan(altitude)      distance a height maps to
-#
-#   0        .. d(bottom) : solid shadow  (wall below the sill)
-#   d(bottom).. d(top)    : the pattern's shadow (nothing, for a plain opening)
-#   d(top)   .. d(wall_h) : solid shadow  (wall above the lintel), faded at the
-#                           tail to meet the march's penumbra without a seam
-#
-# The quads render additively into the wall's own layer bake, filling the gap
-# the strip cut left. UV.y runs up the opening's face, so patterns are
-# authored face-on and the projection skews/stretches them with the sun —
+# An open portal is a vertical BAND in the wall's face (sill `bottom` to
+# lintel `top`, in ft), optionally shaped by a pattern. The wall marches as
+# SOLID; each portal contributes ONE parallelogram into its group's beam-mask
+# viewport (blend_mul over white), whose shader emits the fraction of the
+# solid wall's shadow that survives the opening — see PatternShadow.shader
+# for the maths. The quad spans the beam's whole influence, from where the
+# sun's upper limb first clears the sill (h_b / tan_hi) to where its lower
+# limb last clears the lintel (h_t / tan_lo); the mask is exactly 1 at both
+# edges and along the sides, so the quad's outline cannot render. Sill band,
+# lintel band and the shadow's far tail are all the march's own shadow with
+# its own penumbra. UV.y runs up the opening's face (centre-ray crossing
+# height), so patterns stay authored face-on and skew/stretch with the sun —
 # long dramatic lattices at sunset, compressed at noon.
+#
+# Accepted limit: where a beam crosses ANOTHER same-layer occluder's marched
+# shadow, the beam wins (slightly too bright) — the march stores only the max
+# per layer, so no mask can split it. The old additive scheme double-darkened
+# the same spot; different layers are separate bakes and still darken beams.
 
-func _rebuild_pattern_quads():
+func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 	if _pattern_shader == null:
 		return
 	var sun = sun_settings.get_sun()
 	var alt = clamp(float(sun.get("altitude", 35.0)), 1.0, 89.0)
-	var tan_alt = tan(deg2rad(alt))
+	var tan_c = tan(deg2rad(alt))
 	var tier_px = float(sun.get("tier_px", 256.0))
 	var fps = sun_settings.get_feet_per_square()
 	var dirv = sun_settings.get_shadow_direction()
-	var opacity = clamp(float(sun.get("opacity", 0.55)), 0.0, 1.0)
+	var raster_rect = height_field.get_raster_rect()
+	var d_cap = raster_rect.size.length() if raster_rect != null else 100000.0
 	var quads = 0
 
 	for g in _groups:
@@ -786,55 +852,60 @@ func _rebuild_pattern_quads():
 			if caster == null or not is_instance_valid(caster):
 				continue
 			var cfg = path_tagging.get_config(caster)
-			# Only strip walls have portal gaps to fill.
+			# Beams are a wall-mode concept.
 			if int(cfg.get("side", 0)) != 2:
 				continue
 			var wall_ft = float(cfg.get("height", 1.0)) * fps
-			for portal in path_tagging.get_wall_portals(caster):
-				if not path_tagging.is_portal_open(portal):
-					continue
-				var pcfg = path_tagging.get_portal_cfg(portal)
+			# Shared collection with the blocker gap cutter — includes
+			# proximity-adopted unsnapped doors, which the old builder missed
+			# (gap without a beam).
+			for portal in height_field.get_open_wall_portals(caster):
 				var a = portal.get("Begin")
 				var b = portal.get("End")
 				if not (a is Vector2 and b is Vector2) or (b - a).length() < 1.0:
 					continue
+				var pcfg = path_tagging.get_portal_cfg(portal)
 				var bottom_ft = clamp(float(pcfg.get("bottom", 0.0)), 0.0, wall_ft)
 				var top_ft = clamp(float(pcfg.get("top", 8.0)), bottom_ft, wall_ft)
+				if top_ft <= bottom_ft + 0.01:
+					continue
 				var tile_ft = max(0.5, float(pcfg.get("tile", 2.5)))
 				var pattern = int(clamp(pcfg.get("pattern", 0), 0, _pattern_textures.size() - 1))
 
-				var d_bottom = (bottom_ft / fps) * tier_px / tan_alt
-				var d_top = (top_ft / fps) * tier_px / tan_alt
-				var d_wall = (wall_ft / fps) * tier_px / tan_alt
+				var h_b = (bottom_ft / fps) * tier_px
+				var h_t = (top_ft / fps) * tier_px
+				var h_w = (wall_ft / fps) * tier_px
 				var tile_px = (tile_ft / fps) * tier_px
 				var span_tiles = (b - a).length() / tile_px
 
-				# Wall below the sill.
-				if d_bottom > 1.0:
-					quads += _add_quad(root, a, b, dirv, 0.0, d_bottom,
-						null, 0.0, 0.0, 0.0, opacity, 1.0, 1.0)
-				# The opening itself, pattern-shaped.
-				if pattern > 0 and d_top > d_bottom + 1.0:
-					quads += _add_quad(root, a, b, dirv, d_bottom, d_top,
-						_pattern_textures[pattern], span_tiles,
-						bottom_ft / tile_ft, top_ft / tile_ft, opacity, 1.0, 1.0)
-				# Wall above the lintel: solid, with a faded tail so it meets
-				# the march's penumbra without a hard line.
-				if d_wall > d_top + 1.0:
-					var d_fade = d_top + (d_wall - d_top) * 0.8
-					quads += _add_quad(root, a, b, dirv, d_top, d_fade,
-						null, 0.0, 0.0, 0.0, opacity, 1.0, 1.0)
-					quads += _add_quad(root, a, b, dirv, d_fade, d_wall,
-						null, 0.0, 0.0, 0.0, opacity, 1.0, 0.0)
+				# ONE quad per portal, spanning the beam's whole influence.
+				var d0 = h_b / tan_hi
+				var d1 = min(h_t / max(0.02, tan_lo), d_cap)
+				if d1 <= d0 + 1.0:
+					continue
+				# v = the centre ray's face-crossing height in pattern tiles —
+				# linear in d, so it lives in the UVs, matching the face-on
+				# authoring exactly inside the opening.
+				var v0 = (d0 * tan_c) / tile_px
+				var v1 = (d1 * tan_c) / tile_px
+				quads += _add_quad(root, a, b, dirv, d0, d1,
+					_pattern_textures[pattern] if pattern > 0 else null,
+					span_tiles, v0, v1,
+					{"tan_lo": tan_lo, "tan_hi": tan_hi,
+					"h_bottom_px": h_b, "h_top_px": h_t, "h_wall_px": h_w,
+					"d0_px": d0, "d1_px": d1,
+					"has_pattern": 1.0 if pattern > 0 else 0.0})
 	if quads > 0:
-		outputlog("portal projection: %d quad(s) built" % quads, 1)
+		outputlog("portal beams: %d mask quad(s) built" % quads, 1)
 
 # One projected parallelogram: span a..b extruded along `dirv` from d0 to d1.
-# UVs tile the pattern across the span (u) and up the opening face (v);
-# alpha0/alpha1 are the vertex alphas at the near/far edge (tail fading).
+# UVs tile the pattern across the span (u) and up the opening face (v).
+# COLOR.g interpolates 0 -> 1 from the near to the far edge (the shader
+# recovers d from it), so the mesh must keep FLOAT vertex colours: compress
+# flags 0 — the default ARRAY_COMPRESS_COLOR would quantise the interpolant
+# to 8 bits and band the penumbra ramps.
 func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float,
-	tex, u_tiles: float, v0: float, v1: float, strength: float,
-	alpha0: float, alpha1: float) -> int:
+	tex, u_tiles: float, v0: float, v1: float, params: Dictionary) -> int:
 
 	var p0 = a + dirv * d0
 	var p1 = b + dirv * d0
@@ -845,8 +916,8 @@ func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float
 	var uvs = PoolVector2Array([
 		Vector2(0, v0), Vector2(u_tiles, v0), Vector2(u_tiles, v1),
 		Vector2(0, v0), Vector2(u_tiles, v1), Vector2(0, v1)])
-	var c0 = Color(1, 1, 1, alpha0)
-	var c1 = Color(1, 1, 1, alpha1)
+	var c0 = Color(1, 0, 1, 1)
+	var c1 = Color(1, 1, 1, 1)
 	var colors = PoolColorArray([c0, c0, c1, c0, c1, c1])
 
 	var arrays = []
@@ -855,7 +926,7 @@ func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float
 	arrays[ArrayMesh.ARRAY_TEX_UV] = uvs
 	arrays[ArrayMesh.ARRAY_COLOR] = colors
 	var mesh = ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], 0)
 
 	var mi = MeshInstance2D.new()
 	mi.mesh = mesh
@@ -863,10 +934,36 @@ func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float
 		mi.texture = tex
 	var mat = ShaderMaterial.new()
 	mat.shader = _pattern_shader
-	mat.set_shader_param("strength", strength)
+	for key in params:
+		mat.set_shader_param(key, params[key])
 	mi.material = mat
 	root.add_child(mi)
 	return 1
+
+# Does this layer group contain a Wall-mode caster with at least one open
+# portal? Decides whether a beam-mask render target is worth allocating.
+func _group_has_open_portals(slot: int) -> bool:
+	for caster in height_field.get_group_casters(slot):
+		if caster == null or not is_instance_valid(caster):
+			continue
+		if int(path_tagging.get_config(caster).get("side", 0)) != 2:
+			continue
+		if height_field.get_open_wall_portals(caster).size() > 0:
+			return true
+	return false
+
+# The beam-mask texture of a slot, or null if that group has none.
+func _beam_texture(slot: int):
+	for g in _groups:
+		if g["slot"] == slot:
+			var vp = g.get("beam_vp")
+			if vp == null or not is_instance_valid(vp):
+				return null
+			var t = vp.get_texture()
+			if t != null:
+				t.flags = Texture.FLAG_FILTER
+			return t
+	return null
 
 # Growth factor g such that a geometric series of `steps` terms starting at
 # `base` sums to at least `target`:  base * (g^n - 1) / (g - 1) >= target.
