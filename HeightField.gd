@@ -629,7 +629,12 @@ func _band_tri(tris: Array, a: Vector2, b: Vector2, c: Vector2):
 # tall wall).
 func _band_fan(tris: Array, pivot: Vector2, n0: Vector2, n1: Vector2, dist: float):
 	var ang = n0.angle_to(n1)
-	if abs(ang) < 0.01:
+	# Skip only float-noise joints. A 0.01 rad cutoff left a REAL uncovered
+	# wedge between the two swept rectangles (they only meet exactly at ang=0):
+	# at a 4000 px band reach a 0.0099 rad joint leaked a ~40 px-wide sliver of
+	# un-suppressed shadow at the rim — visible streaks on gently curved walls.
+	# At 1e-4 the worst leak is sub-pixel.
+	if abs(ang) < 0.0001:
 		return
 	var steps = int(max(1, ceil(abs(ang) / 0.6)))
 	var r = dist / cos(abs(ang) / float(steps) * 0.5)
