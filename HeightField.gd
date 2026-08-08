@@ -1328,6 +1328,11 @@ func rebuild():
 		var chain = _chains[int(gi / SLOTS_PER_CHAIN)]
 		var channel = gi % SLOTS_PER_CHAIN
 		var group_drawn = 0
+		# Strip casters are collected rather than drawn: they combine with
+		# max, which is built by cutting (see the loop after this one).
+		var pending = []
+		var slot_before = 0.0
+		var slot_after = 0.0
 
 		for path in group["casters"]:
 			# Projector-only walls are here for the ghost prop, not the field.
@@ -1374,10 +1379,18 @@ func rebuild():
 				for cleaned in _clean_polygon(poly):
 					parts.append(cleaned)
 
-			for poly in parts:
-				if _draw_fill(chain, gi, channel, path, height, poly):
-					drawn += 1
-					group_drawn += 1
+			if is_wall or side == 2:
+				# STRIP CASTERS — a wall is a thing standing on ground, and
+				# two walls crossing is one corner, not a tower. Collected
+				# here and drawn by the max loop below.
+				pending.append({"path": path, "height": height, "parts": parts})
+			else:
+				# CONTOUR FILLS — topographic lines. Adding them IS the
+				# feature: nested contours ascend into a summit. Untouched.
+				for poly in parts:
+					if _draw_fill(chain, gi, channel, path, height, poly):
+						drawn += 1
+						group_drawn += 1
 
 			# ART FOOTPRINT — only now, after the fill actually rasterised. A
 			# contour whose closure failed (`polys.size() == 0` above) must not
@@ -1387,6 +1400,71 @@ func rebuild():
 				art_candidates += 1
 				if _draw_art_footprint(chain, gi, channel, path, height, vp_size) > 0:
 					art_raised += 1
+
+		# ---------------------------------------------------------------
+		# WALL OVERLAP MAX
+		# ---------------------------------------------------------------
+		# Elevation where two walls cross is the taller wall, not the sum. A
+		# corner of two 5 ft walls is a 5 ft corner; today it is a 10 ft tower
+		# throwing a shadow twice as long as the walls it belongs to.
+		#
+		# ACROSS layers the sum stays right and intended (separate channels), and
+		# a strip over a CONTOUR still sums, because a wall on raised ground is
+		# raised: 10 ft of wall on a 20 ft cliff really is 30 ft.
+		#
+		# There is no MAX blend in Godot 3 to do this with, so the max is built
+		# in Clipper: draw the TALLEST first and subtract everything already
+		# placed out of each shorter one, which makes the additive raster sum to
+		# the maximum by construction. Subtraction uses the ORIGINAL regions, not
+		# the trimmed remainders, or a tall region's ground would be re-claimed
+		# by a short one that merely overlapped the same area later.
+		pending.sort_custom(self, "_by_height_desc")
+		var placed = []          # [{poly, bbox}] — originals, tallest first
+		for entry in pending:
+			var epath = entry["path"]
+			var eheight = float(entry["height"])
+			var kept = entry["parts"]
+			for cut in placed:
+				if kept.size() == 0:
+					break
+				kept = _poly_minus_bboxed(kept, cut)
+			# Ear clipping SUCCEEDS on a self-touching polygon, emitting
+			# overlapping triangles that blend_add then doubles — recreating the
+			# very stacking this loop removes. Clean every subtracted piece.
+			var simple = []
+			for poly in kept:
+				for cleaned in _clean_polygon(poly):
+					simple.append(cleaned)
+			kept = simple
+			var before_area = 0.0
+			for poly in entry["parts"]:
+				before_area += abs(_poly_area(poly))
+			var after_area = 0.0
+			for poly in kept:
+				after_area += abs(_poly_area(poly))
+			slot_before += before_area
+			slot_after += after_area
+			if kept.size() != entry["parts"].size() or after_area < before_area - 1.0:
+				outputlog("  slot %d path %s h=%.2f: %d part(s) %.1f%% of map -> %d piece(s) %.1f%% after wall overlap max" % [
+					gi, str(core.get_node_id(epath)), eheight, entry["parts"].size(),
+					100.0 * before_area / _map_area(), kept.size(),
+					100.0 * after_area / _map_area()], 0)
+			for poly in kept:
+				if _draw_fill(chain, gi, channel, epath, eheight, poly):
+					drawn += 1
+					group_drawn += 1
+			for poly in entry["parts"]:
+				placed.append({"poly": poly, "bbox": _poly_bbox(poly)})
+
+		# THE ACCEPT TEST, arithmetic rather than aesthetic: a slot's strip fills
+		# must stop summing to more ground than they actually cover. Scoped to
+		# strips — contours legitimately sum, so a whole-slot version of this
+		# would fire on every normal map.
+		if pending.size() > 0:
+			outputlog("slot %d wall overlap max: %d strip fill(s), %.1f%% -> %.1f%% of map (%.1fpp of overlap removed)" % [
+				gi, pending.size(), 100.0 * slot_before / _map_area(),
+				100.0 * slot_after / _map_area(),
+				100.0 * (slot_before - slot_after) / _map_area()], 0)
 
 		outputlog("slot %d: layer %d -> chain %d channel %s, %d caster(s), %d polygon(s)" % [
 			gi, int(group["layer"]), int(gi / SLOTS_PER_CHAIN), ["R", "G", "B"][channel],
@@ -1402,6 +1480,8 @@ func rebuild():
 	outputlog("art footprint [artfoot v4] %s: %d of %d contour path(s) raised onto their own art (alpha >= %.2f) | per-slot clamp tiers: %s" % [
 		"ON" if bool(sun_settings.get_sun().get("bake_art_elevation", true)) else "OFF (Art raises elevation unticked)",
 		art_raised, art_candidates, ART_ALPHA_THRESHOLD, clamp_parts.join(" / ")], 0)
+
+	outputlog("wall overlap: max [walloverlap v1]", 0)
 
 	_build_smooth_passes(vp_size)
 	_build_art_masks(vp_size)
