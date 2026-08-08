@@ -1,103 +1,205 @@
 # Elevation Shadows
 
-Sun-aware terrain shadows for [Dungeondraft](https://dungeondraft.net/),
-cast from your cliff and wall paths. Draw your terrain the way you already
-do — nested contour paths on one level — tag them with a height in feet, and
-the mod computes physically accurate shadows for the whole map: correct
-lengths from height and sun angle, soft penumbra that widens with distance,
-multi-tier stacking, and shadows that respect Dungeondraft's layers and
-Bring to front / Send to back.
+**A sun for your [Dungeondraft](https://dungeondraft.net/) map.** Tag a cliff
+with a height in feet, and the mod works out the shadow — the right length for
+that height and that sun, softening as it travels, stacking across tiers,
+respecting your layers. Then it keeps going: light through windows, patterns
+through grates, and a tree's own artwork stretched across the ground.
 
-Built for TTRPG battlemaps: heights are entered in **feet** (one grid square
-= 5 ft), and when someone asks how long a 20 ft cliff's shadow should be,
-the answer on screen is the physically correct one — `height / tan(sun
-altitude)`. Want drama? Lower the sun. The numbers stay honest.
+Heights are in feet, one grid square = 5 ft, and a 20 ft cliff casts exactly
+`height / tan(sun altitude)`. Want drama? Lower the sun. The numbers stay
+honest.
 
-## Features
+---
 
-- **One global sun** (direction + height), synced both ways with
-  Dungeondraft's native roof sun so cliffs and roofs agree.
-- **Physically accurate lengths** with live readouts: the path panel shows
-  "Casts 34 ft of shadow (6.9 squares)" for the selected cliff, and the sun
-  panel shows the current shadow-to-wall-height ratio.
-- **Real penumbra.** Diffusion models the sun's angular size: low = crisp
-  desert light, high = soft overcast. Blur widens with distance from the
-  cliff, like the real thing — no fake gradient tricks.
-- **Terrain steps and free-standing walls.** A path is either a contour
-  (one side uphill: Side A/B) or a **Wall** — only the path's strip is
-  raised, both sides low. A closed circle of wall shades its own interior
-  on the sun-facing arc: instant crater.
-- **One-sided walls.** On a Dungeondraft wall, Side A / Side B cast on ONE
-  side only: a closed house wall on Side A shades the outside world while
-  the interior stays completely lit (so indoor light sources read
-  correctly); Side B shades the inside only (courtyards). Flip the button
-  if it lands on the wrong side; **Both sides** is the classic strip.
-- **Multi-tier aware.** Nested contours stack (three 5 ft contours = a
-  15 ft summit), shadows fall correctly across other tiers, and overlapping
-  shadows never double-darken.
-- **Respects your layering.** A layer-4 path's shadow darkens layer-2 cliff
-  art. Objects escape or receive a shadow with Dungeondraft's own
-  **Bring to front / Send to back** buttons — per object, saved with the
-  map. Cliff art hides the shadow's leading edge under its real bumpy
-  texture edge (per-path *Art above shadow* toggle + *Shadow inset* for
-  fine-tuning).
-- **Export-ready.** Shadows land in PNG and Universal VTT exports exactly
-  as layered in the editor, and the shadow textures re-bake at double
-  resolution while the export dialog is open so a 100 px/square export
-  stays crisp.
-- Live / Export-only / Off modes, and everything is baked — panning and
-  zooming cost nothing.
+## Turn the sun, and the canyon turns with it
 
-## Installation
+![Terrain shadows following the sun](docs/media/terrain-shadows.gif)
 
-Copy the `ElevationShadows` folder into your Dungeondraft `mods` directory
-and enable **Elevation Shadows** in the Mods menu. Built and tested against
+Every cliff edge here is an ordinary Dungeondraft path, drawn the way you
+already draw them — nested contours on one level. Tagging them with a drop
+height is the whole job. The mod rasterises those contours into a height field
+and marches each pixel toward the sun, so the shadows are *computed*, not
+stamped: they lengthen as the sun drops, sweep as it turns, fall correctly
+across the tiers below them, and never double-darken where they overlap.
+
+The soft edges are real penumbra. Diffusion models the sun's angular size, so
+blur widens with distance from the cliff the way it does outdoors — crisp
+desert light at one end of the slider, overcast at the other.
+
+Panning and zooming cost nothing; it's all baked and only re-bakes when
+something actually changes.
+
+---
+
+## Windows throw light, not just gaps
+
+![A window pattern projected on an interior floor](docs/media/portal-pattern.gif)
+
+Doors and windows are Dungeondraft portals, and each one can be opened to the
+sun. An open portal cuts a gap in its wall's shadow — but it can also **project
+its pattern**: pick Bars, Window panes, Diamond lattice, Plus holes or Checker,
+set how high the opening sits in the wall, and the light lands on the floor as
+the classic window cross, skewed and stretched by the sun's angle.
+
+Projection is independent of everything else. A closed door still projects. A
+house set to shade only its exterior — so Dungeondraft's own interior lights
+read correctly — still gets window patterns across its floor. It works on a map
+with no elevation shadows at all.
+
+---
+
+## Cast a tree from a tree
+
+![A yucca casting its own artwork as a shadow](docs/media/tree-shadow.gif)
+
+Objects cast too, and this is the fun one. Point an object's pattern at a
+**custom texture** — any PNG or WebP, where any pixel above 0% opacity blocks
+the light — and set **Profile** mode. The image stands up from the middle of
+the object and stretches along the ground.
+
+Here that texture is the yucca's own asset art. Raise *Shadow top* and the
+shadow reaches further, exactly as a taller wall would. Turn the sun and the
+whole silhouette swings around the trunk. Draw a tree from the side and cast it
+from a top-down tree; hang the pattern off the ground for something suspended;
+or use **Traced** mode instead to sweep the object's real outline along the sun
+with a pattern tiled into it — crates, cages, grates.
+
+---
+
+## The rest of it
+
+- **Terrain steps and free-standing walls.** A path is either a contour (one
+  side uphill) or a **Wall** — only its own strip raised, both sides low. A
+  closed circle of wall shades its own interior on the sun-facing arc: instant
+  crater.
+- **One-sided walls.** On a Dungeondraft wall, Side A / Side B cast on *one*
+  side only. A closed house wall on Side A shades the outside world while the
+  interior stays completely lit; Side B shades the inside only, for courtyards.
+- **Multi-tier stacking.** Three 5 ft contours make a 15 ft summit, and the
+  shadow length follows.
+- **Respects your layering.** A layer-4 path's shadow darkens layer-2 cliff art.
+  Objects escape or receive a shadow with Dungeondraft's own **Bring to front /
+  Send to back** — per object, saved with the map. Cliff art can hide the
+  shadow's leading edge under its own bumpy texture edge.
+- **Live readouts.** The path panel says "Casts 34 ft of shadow (6.9 squares)"
+  for the selected cliff; the sun panel shows the current shadow-to-height
+  ratio.
+- **Tint.** Black by default and neutral. Cool blue-violet reads as daylight, a
+  warm brown as dusk. Hue only — darkness stays with Strength.
+- **Export-ready.** Shadows land in PNG and Universal VTT exports exactly as
+  layered in the editor, and the textures re-bake at double resolution while the
+  export dialog is open, so a 100 px/square export stays crisp.
+- **Live / Export-only / Off** modes, so you can keep the editor light and only
+  pay for shadows on the way out.
+
+---
+
+## Install
+
+Copy the `ElevationShadows` folder into your Dungeondraft `mods` directory and
+enable **Elevation Shadows** in the Mods menu. Built and tested against
 Dungeondraft 1.2.0.1.
 
-## Workflow
+## Five-minute start
 
-1. Open the **Elevation Shadows** tool (Effects category). Set the sun's
-   Direction and Sun height — or leave *Follow DD roof sun* on and use the
-   roof tool's sun you already know.
-2. Draw your cliff as a normal path on whatever layer it belongs to.
-3. Select it, toggle **Elevation Shadow**, and pick the side: **Side A/B**
-   for a terrain step (which side is uphill), or **Wall (both)** for a
-   free-standing wall. Flip once if the fill lands on the wrong side.
-4. Set **Drop height** in feet (slider to 120 ft; type into the box for up
-   to 240 ft). The readout tells you what it casts at the current sun.
-5. Objects: anything on the caster's layer starts lit. **Send to back** to
-   push it under the shadow, **Bring to front** to lift it out.
-6. Export as usual — PNG and Universal VTT both include the shadows.
+1. Open the **Elevation Shadows** tool (Effects category) and set **Direction**
+   and **Sun height**.
+2. Draw a cliff as a normal path, on whatever layer it belongs to.
+3. Select it, switch on **Elevation Shadow**, and pick a side: **Side A/B** for
+   a terrain step (which side is uphill), or **Wall (both)** for a free-standing
+   wall. Flip it once if the fill lands on the wrong side.
+4. Set **Drop height** in feet. The readout tells you what it casts at the
+   current sun.
+5. Objects on the caster's layer start lit — **Send to back** pushes one under
+   the shadow, **Bring to front** lifts it out.
+6. Export as usual.
 
-### Per-path settings
+<details>
+<summary><b>Every setting</b></summary>
 
-| Setting | What it does |
-|---|---|
-| Elevation Shadow | This path casts (and raises the terrain on its uphill side). |
-| Side A / Side B / Wall (both) | Paths: which side is uphill — or a free-standing wall strip. Walls: which side the shadow falls on (A/B = one side only, Both sides = classic strip). |
-| Drop height (ft) | How far the ground drops. Drives shadow length physically. |
-| Art above shadow | The path's artwork draws over its own layer's shadow, so the texture's real edge hides where the shadow starts. On by default for casters. |
-| Shadow inset | Fine-tune (in px) how far the shadow tucks under the art's edge. |
-
-### Global settings
+### Global (Elevation Shadows tool)
 
 | Setting | What it does |
 |---|---|
 | Off / Export only / Live | Master mode. Export only keeps the editor light and injects shadows only while exporting. |
-| Direction | Compass direction the light comes from. Syncs with the roof sun. |
+| Direction | Compass direction the light comes from. |
 | Sun height | Sun altitude. Low sun = long shadows. The realism note updates live. |
 | Strength | How dark shadows are. |
 | Diffusion | The sun's angular size: edge softness, widening with distance. |
-| Tint | The shadow's colour cast. Black (the default) is neutral; a cool blue-violet reads as daylight, a warm brown as dusk. Hue only — darkness stays with Strength. |
+| Tint | The shadow's colour cast. Hue only — darkness stays with Strength. |
+| Art raises elevation | Contour art itself lifts the height field, so texture bumps read as ground. |
 | Show elevation field | Debug overlay of the computed terrain heights. |
 
-## How it works (short version)
+### Per path / wall
+
+| Setting | What it does |
+|---|---|
+| Elevation Shadow | This path casts, and raises the terrain on its uphill side. |
+| Side A / Side B / Wall (both) | Paths: which side is uphill, or a free-standing wall strip. Walls: which side the shadow falls on (A/B = one side only). |
+| Drop height (ft) | How far the ground drops. Drives shadow length physically. Slider to 120 ft; type into the box for up to 240 ft. |
+| Art above shadow | The path's artwork draws over its own layer's shadow, so the texture's real edge hides where the shadow starts. On by default for casters. |
+| Shadow inset | Fine-tune (in px) how far the shadow tucks under the art's edge. |
+
+### Per portal (door / window)
+
+| Setting | What it does |
+|---|---|
+| Open for sunlight | This opening lets the sun through its wall: a gap in the wall's shadow, and cliff shadows behind it pass through the doorway. |
+| Project pattern | Cast the pattern onto the floor even where the wall casts no shadow. Independent of the toggle above — a closed door still projects. |
+| Light pattern | None (open), Bars, Window panes, Diamond lattice, Plus holes, Checker, or a custom texture. |
+| Opening top / bottom (ft) | Where the opening sits in the wall's face. |
+| Pattern size (ft) | One bar / pane / plus per this many feet. |
+
+### Per object
+
+| Setting | What it does |
+|---|---|
+| Cast pattern shadow | This object casts its pattern onto the ground, as if it blocked the sun in that shape. |
+| Cast mode | **Traced**: the object's own outline swept along the sun, pattern tiled into it. **Profile**: the image cast once, standing up from the object's middle and stretched along the ground. |
+| Pattern | Bars, Window panes, Diamond lattice, Plus holes, Checker, Solid, or a custom texture (alpha above 0% blocks light). |
+| Pattern size (ft) | Tile size of the pattern. |
+| Shadow top / bottom (ft) | How high up the object the pattern reaches, and how far off the ground it starts. Raise the bottom for something hanging. |
+| Width adjust (ft) | The shadow is already as wide as the object's artwork; this widens (+) or narrows (−) it. |
+
+</details>
+
+## How it works
 
 Contour paths are treated as topographic lines and rasterised into a height
 field — elevation at any point is the sum of every contour whose uphill side
-contains it. A per-pixel shader then marches from each point toward the sun
-through that field, computing the horizon angle against the sun's angular
-extent. The result is baked to textures (one per Dungeondraft layer in use,
-placed so layer ordering works out) and re-baked only when something
-changes. Per-path config is stored in the map file via Dungeondraft's mod
-data, so everything survives save/reload.
+contains it. A per-pixel shader marches from each point toward the sun through
+that field, comparing the horizon angle against the sun's angular extent, which
+is where both the correct length and the distance-widening penumbra come from.
+Portal beams and object patterns ride a second mask that multiplies into the
+same bake, so a pattern never fights the march that produced it.
+
+Results are baked to textures — one per Dungeondraft layer in use, placed so
+layer ordering works out — and re-baked only when something changes. Per-path,
+per-portal and per-object config lives in the map file via Dungeondraft's mod
+data, so it all survives save and reload.
+
+## Known bugs
+
+- **Wall and portal shadows ignore layering.** Anything cast by a wall — its
+  shadow and its projected portal patterns — draws on top of every user layer,
+  so a walkway on layer 400 crossing over a gate still gets the gate's shadow
+  painted across it. Dungeondraft keeps walls in their own container above
+  layers 100–400, and the shadow inherits that position, so no per-wall or
+  per-portal setting can push it under. Paths are unaffected; only wall-based
+  casters have this.
+
+  **Workaround:** put the thing that should stay clear on **Above Roofs (900)**,
+  which sits above the wall container — a walkway crossing over a gate reads
+  correctly there. Keep it a plain object; an *elevation caster* on 700/900 has
+  its own trouble with wall openings below it.
+- **Walls stack where they overlap.** Two 5 ft walls crossing at a corner make
+  that corner 10 ft, and it casts a sudden longer shadow from one small patch.
+  Heights combine by adding — which is what makes nested contours stack into a
+  summit — and wall strips currently go through the same combine. It shows up
+  most when a map grows by addition: a long city wall, then buildings and
+  stairs tacked onto it, each junction a bump. Nudging one wall so the ends
+  meet rather than overlap avoids it for now.
+- **Follow DD roof sun inverts one axis.** East/west follows correctly,
+  north/south is flipped, so roof shading and elevation shadows disagree. Set
+  the mod's own Direction until this is fixed.
