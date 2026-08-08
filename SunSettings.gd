@@ -90,6 +90,11 @@ const SUN_DEFAULTS = {
 const MESH_KEYS = ["azimuth", "altitude", "opacity", "softness", "shadow_tint", "tier_px"]
 const FIELD_KEYS = ["tier_px", "level_blend"]
 
+# Side of the Direction compass dial, px. The dial row is the panel's one row
+# taller than a slider, so this is the panel's height budget knob — keep it
+# small. Every radius inside the dial derives from it.
+const DIAL_SIZE = 84
+
 var sun = {}
 var ui = {}
 
@@ -220,8 +225,8 @@ func _build_ui(parent):
 	title.text = "Global Sun"
 	parent.add_child(title)
 
-	ui["azimuth"] = _add_slider_row(parent, "Direction", "azimuth", 0.0, 359.0, 1.0,
-		"Compass direction the light comes FROM.\n0 = from the top of the map.")
+	ui["azimuth"] = _add_dial_row(parent, "Direction", "azimuth",
+		"Compass direction the light comes FROM — the needle points AT the sun,\nshadows fall the opposite way. 0 = from the top of the map.\nDrag the dial, or type exact degrees.")
 	ui["altitude"] = _add_slider_row(parent, "Sun height", "altitude", 1.0, 89.0, 1.0,
 		"How high the sun sits.\nLow = long shadows. This is the main length control.")
 
@@ -322,6 +327,106 @@ func _add_slider_row(parent, label_text: String, key: String,
 		str(slider.value), err_s, err_p], 0)
 	return {"slider": slider, "spin": spin}
 
+# Label + compass dial + spinbox, two-way bound, writing into `sun[key]`.
+# The Direction row: same label/spin layout as _add_slider_row, with the dial
+# sitting centered in the stretch space the slider used to fill. The dial is a
+# plain Control driven through its `draw` and `gui_input` signals — this
+# script is a Reference, so the Control cannot carry a script of its own, and
+# the signal hooks are the same _draw/_gui_input machinery from outside. The
+# current angle rides the Control as its "angle" meta.
+func _add_dial_row(parent, label_text: String, key: String, tip: String = "") -> Dictionary:
+	var row = HBoxContainer.new()
+
+	var label = Label.new()
+	label.text = label_text
+	label.rect_min_size = Vector2(104, 0)
+	label.clip_text = true
+	label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	if tip != "":
+		label.hint_tooltip = tip
+	row.add_child(label)
+
+	var dial = Control.new()
+	dial.rect_min_size = Vector2(DIAL_SIZE, DIAL_SIZE)
+	dial.set_meta("dragging", false)
+	if tip != "":
+		dial.hint_tooltip = tip
+	var err_d = dial.connect("draw", self, "_on_dial_draw", [dial])
+	var err_g = dial.connect("gui_input", self, "_on_dial_input", [dial, key])
+	var wrap = CenterContainer.new()
+	wrap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	wrap.add_child(dial)
+	row.add_child(wrap)
+
+	var spin = SpinBox.new()
+	spin.min_value = 0.0
+	spin.max_value = 359.0
+	spin.step = 1.0
+	spin.value = sun.get(key, 0.0)
+	spin.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var err_p = spin.connect("value_changed", self, "_on_spin_changed", [key])
+	row.add_child(spin)
+
+	parent.add_child(row)
+	# Same build-time wiring report as the slider rows: a dead signal must be
+	# diagnosable from the log, not inferred from behaviour.
+	outputlog("row '%s' key=%s dial init=%s connect(draw)=%d connect(gui)=%d connect(spin)=%d" % [
+		label_text, key, str(sun.get(key, 0.0)), err_d, err_g, err_p], 0)
+	return {"dial": dial, "spin": spin}
+
+# All dial painting lives here, via the `draw` signal — the draw_* calls a
+# _draw() override would make, invoked on the dial from outside.
+func _on_dial_draw(dial):
+	var c = dial.rect_size / 2.0
+	var r = min(c.x, c.y) - 2.0
+	# Dark disc + rim, matching DD's panel colours.
+	dial.draw_circle(c, r, Color(0.13, 0.13, 0.15, 1.0))
+	dial.draw_arc(c, r, 0.0, TAU, 48, Color(0.36, 0.36, 0.40, 1.0), 1.5, true)
+	# Cardinal ticks. Azimuth 0 = light from the top of the map, so the top
+	# tick is the longer, brighter one — the dial's "north".
+	for i in range(4):
+		var tick_dir = Vector2(sin(i * PI / 2.0), -cos(i * PI / 2.0))
+		var inner = r - (9.0 if i == 0 else 6.0)
+		var tick_col = Color(0.75, 0.75, 0.80, 1.0) if i == 0 else Color(0.45, 0.45, 0.50, 1.0)
+		dial.draw_line(c + tick_dir * inner, c + tick_dir * (r - 1.0), tick_col,
+			2.0 if i == 0 else 1.0, true)
+	# Needle points AT the sun (azimuth is where the light comes FROM); the
+	# shadow falls opposite the knob. Taken straight from the vector the march
+	# itself uses, negated, so needle and shadows cannot disagree — this row is
+	# the azimuth control, and the convention lives in get_shadow_direction.
+	var sun_dir = -get_shadow_direction()
+	dial.draw_line(c, c + sun_dir * (r - 10.0), Color(0.85, 0.82, 0.70, 1.0), 2.0, true)
+	dial.draw_circle(c + sun_dir * (r - 10.0), 4.5, Color(0.95, 0.80, 0.35, 1.0))
+	dial.draw_circle(c, 2.0, Color(0.55, 0.55, 0.60, 1.0))
+
+# Click sets the angle immediately; holding the button drags it. Godot routes
+# mouse events to the pressed control until release, so the drag keeps working
+# when the pointer leaves the disc (event.position stays dial-local).
+func _on_dial_input(event, dial, key):
+	if event is InputEventMouseButton and event.button_index == BUTTON_LEFT:
+		dial.set_meta("dragging", event.pressed)
+		if event.pressed:
+			_dial_from_mouse(event.position, dial, key)
+	elif event is InputEventMouseMotion and dial.get_meta("dragging"):
+		_dial_from_mouse(event.position, dial, key)
+
+# Mouse position (dial-local) -> whole azimuth degrees, then straight down the
+# slider rows' commit path. Distance from center is ignored — only the bearing
+# matters on a pure angle dial. There is no _syncing guard here: _syncing is
+# only ever true inside a handler assigning control properties, and no mouse
+# event can be dispatched during one, so a dial drag can never arrive echoed.
+func _dial_from_mouse(pos: Vector2, dial, key):
+	var d = pos - dial.rect_size / 2.0
+	if d.length() < 2.0:
+		return  # dead center: bearing undefined, keep the current angle
+	# Compass bearing in screen space (+y down): 0 = up, clockwise positive.
+	var deg = fposmod(round(rad2deg(atan2(d.x, -d.y))), 360.0)
+	if deg == fposmod(float(sun.get(key, 0.0)), 360.0):
+		return  # motion within the same whole degree — no value change, no rebuild
+	outputlog("dial event key=%s value=%s" % [key, str(deg)], 1)
+	_on_slider_changed(deg, key)
+	dial.update()
+
 # Label + ColorPickerButton, one-way bound: the picker writes an html hex
 # STRING into `sun[key]` (see the shadow_tint note in SUN_DEFAULTS for why a
 # string and not a Color). Same single-row layout as _add_slider_row — the
@@ -380,9 +485,19 @@ func _on_spin_changed(value, key):
 		return
 	_set_value(key, value)
 	_syncing = true
-	if ui.has(key):
-		ui[key]["slider"].value = value
+	_sync_row_widget(key, value)
 	_syncing = false
+
+# A key's value-widget (everything but its spinbox), for the two places that
+# push state outwards. Slider rows carry a slider; the Direction row carries a
+# dial, which paints from sun[] and so only needs a repaint.
+func _sync_row_widget(key: String, value):
+	if not ui.has(key) or not (ui[key] is Dictionary):
+		return
+	if ui[key].has("slider"):
+		ui[key]["slider"].value = value
+	if ui[key].has("dial"):
+		ui[key]["dial"].update()
 
 func _on_mode_pressed(mode_index):
 	_set_value("mode", mode_index)
@@ -445,7 +560,7 @@ func _sync_ui_from_state():
 			continue
 		if not sun.has(key):
 			continue
-		ui[key]["slider"].value = sun[key]
+		_sync_row_widget(key, sun[key])
 		ui[key]["spin"].value = sun[key]
 	for flag_key in ["follow_roof_sun", "debug_height_field"]:
 		if ui.has(flag_key) and ui[flag_key] is CheckButton:
