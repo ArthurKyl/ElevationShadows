@@ -193,6 +193,13 @@ data, so it all survives save and reload.
   which sits above the wall container — a walkway crossing over a gate reads
   correctly there. Keep it a plain object; an *elevation caster* on 700/900 has
   its own trouble with wall openings below it.
+- **Walls stack where they overlap.** Two 5 ft walls crossing at a corner make
+  that corner 10 ft, and it casts a sudden longer shadow from one small patch.
+  Heights combine by adding — which is what makes nested contours stack into a
+  summit — and wall strips currently go through the same combine. It shows up
+  most when a map grows by addition: a long city wall, then buildings and
+  stairs tacked onto it, each junction a bump. Nudging one wall so the ends
+  meet rather than overlap avoids it for now.
 - **Follow DD roof sun inverts one axis.** East/west follows correctly,
   north/south is flipped, so roof shading and elevation shadows disagree. Set
   the mod's own Direction until this is fixed.
