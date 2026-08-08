@@ -201,3 +201,16 @@ data, so it all survives save and reload.
 - **Follow DD roof sun inverts one axis.** East/west follows correctly,
   north/south is flipped, so roof shading and elevation shadows disagree. Set
   the mod's own Direction until this is fixed.
+
+## License
+
+Copyright © 2026 ArthurKyl.
+
+Licensed under the [GNU General Public License v3.0](LICENSE). Fork it, change
+it, contribute back — that's all welcome. The one condition is that anything
+you distribute built on this code ships its source under the GPL too, so it
+stays open for the next person.
+
+**The maps you make with it are entirely yours.** The licence covers this
+mod's source code, not your work. Sell your battlemaps, put them on Patreon,
+use them commercially however you like — none of that is affected.
