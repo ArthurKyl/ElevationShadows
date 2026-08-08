@@ -67,6 +67,7 @@ var core = null
 var sun_settings = null
 var path_tagging = null
 var height_field = null
+var silhouette = null
 
 const PROP_NAME = "ElevationShadowsRender"
 
@@ -104,6 +105,11 @@ const TARGET_STRIDE_TEXELS = 1.5
 const BAKE_MAX_DIM = 2048.0
 const EXPORT_BAKE_MAX_DIM = 4096.0
 var export_boost = false
+
+# Emitter width can never go below this. Guards a fully-transparent asset, a
+# failed measurement, and a width adjust more negative than the art is wide —
+# any of which would otherwise produce a zero-width or inside-out quad.
+const MIN_EMITTER_PX = 8.0
 
 func _bake_cap() -> float:
 	return EXPORT_BAKE_MAX_DIM if export_boost else BAKE_MAX_DIM
@@ -148,6 +154,10 @@ func initialise():
 		global.Root + "shaders/ProjectedPattern.shader", "Shader", true)
 	if _projection_shader == null:
 		outputlog("WARNING: ProjectedPattern.shader failed to load — no projected patterns", 0)
+	_traced_shader = ResourceLoader.load(
+		global.Root + "shaders/TracedShadow.shader", "Shader", true)
+	if _traced_shader == null:
+		outputlog("WARNING: TracedShadow.shader failed to load — traced object shadows disabled", 0)
 	_make_pattern_textures()
 	outputlog("shaders loaded", 0)
 
@@ -161,6 +171,7 @@ func initialise():
 
 var _pattern_shader = null
 var _projection_shader = null
+var _traced_shader = null
 var _pattern_textures = []
 
 func _make_pattern_textures():
@@ -177,7 +188,21 @@ func _make_pattern_textures():
 		var tex = ImageTexture.new()
 		tex.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER)
 		_pattern_textures.append(tex)
-	outputlog("%d light patterns generated" % (_pattern_textures.size() - 1), 1)
+	# Index 6 is PATTERN_CUSTOM, resolved from the user's own file rather than
+	# generated — a placeholder keeps the array indexable by pattern value.
+	_pattern_textures.append(null)
+	# Index 7, PATTERN_SOLID: opaque everywhere, so the object casts an ordinary
+	# unpatterned shadow through the exact same path as every pattern.
+	var solid_img = Image.new()
+	solid_img.create(4, 4, false, Image.FORMAT_RGBA8)
+	solid_img.fill(Color(1, 1, 1, 1))
+	var solid_tex = ImageTexture.new()
+	solid_tex.create_from_image(solid_img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER)
+	_pattern_textures.append(solid_tex)
+	# size is now 8: minus index 0 (None), index 6 (Custom placeholder) and
+	# index 7 (Solid) leaves 5 — the generated patterns, which is what the old
+	# "- 1" counted before those two indices existed.
+	outputlog("%d light patterns generated (+ solid)" % (_pattern_textures.size() - 3), 1)
 
 # CUSTOM patterns (pattern == PathTagging.PATTERN_CUSTOM): a user image whose
 # alpha is the blocker, under Arthur's binary contract — any texel with alpha
@@ -206,12 +231,12 @@ func _load_custom_pattern(path: String):
 	var img = Image.new()
 	var err = img.load(path)
 	if err != OK:
-		outputlog("WARNING: custom pattern '%s' failed to load (err %d) — its portals fall back to plain openings" % [path, err], 0)
+		outputlog("WARNING: custom pattern '%s' failed to load (err %d) — its projectors get no pattern (a portal falls back to a plain opening; an object casts nothing)" % [path, err], 0)
 		return null
 	var src_w = img.get_width()
 	var src_h = img.get_height()
 	if src_w < 1 or src_h < 1:
-		outputlog("WARNING: custom pattern '%s' is empty — its portals fall back to plain openings" % path, 0)
+		outputlog("WARNING: custom pattern '%s' is empty — its projectors get no pattern (a portal falls back to a plain opening; an object casts nothing)" % path, 0)
 		return null
 	img.convert(Image.FORMAT_RGBA8)
 	# The pattern tiles at a few ft — 512 px per tile is already past what any
@@ -960,20 +985,27 @@ func update_uniforms():
 # per layer, so no mask can split it. The old additive scheme double-darkened
 # the same spot; different layers are separate bakes and still darken beams.
 
-# A portal's pattern as a texture, or null for a plain opening. Shared by the
-# beam mask and the projection so the two can never disagree about what a
-# portal's pattern is. Returns [texture, used_custom, missing_custom] so the
-# caller can keep its own counters.
-func _portal_pattern_texture(portal, pcfg: Dictionary) -> Array:
-	var pattern = int(clamp(pcfg.get("pattern", 0), 0, path_tagging.PATTERN_CUSTOM))
+# A projector's pattern as a texture, or null for "nothing to cast". Shared by
+# the beam mask, the portal projection and the object projection, so the three
+# can never disagree about what a pattern is. Returns [texture, used_custom,
+# missing_custom] so the caller can keep its own counters. Nothing in here is
+# portal-specific — it only wants a node to name in the log and a cfg dict.
+func _projector_pattern_texture(projector, cfg: Dictionary) -> Array:
+	var pattern = int(clamp(cfg.get("pattern", 0), 0, path_tagging.PATTERN_SOLID))
 	if pattern == path_tagging.PATTERN_CUSTOM:
-		var pfile = str(pcfg.get("pattern_file", ""))
+		var pfile = str(cfg.get("pattern_file", ""))
 		var tex = _get_custom_pattern(pfile)
 		if tex != null:
 			return [tex, true, false]
-		outputlog("portal %s: custom pattern '%s' unavailable — plain opening" % [
-			str(core.get_node_id(portal)), pfile], 1)
+		outputlog("projector %s: custom pattern '%s' unavailable — no pattern (a portal falls back to a plain opening; an object casts nothing)" % [
+			str(core.get_node_id(projector)), pfile], 1)
 		return [null, false, true]
+	# Explicit rather than falling through to the `pattern > 0` lookup below.
+	# That lookup would in fact land on the same texture — index 7 is the last
+	# element, so its min() clamp is a no-op — but only by coincidence of Solid
+	# being appended last, and the next appended pattern would silently break it.
+	if pattern == path_tagging.PATTERN_SOLID:
+		return [_pattern_textures[path_tagging.PATTERN_SOLID], false, false]
 	if pattern > 0:
 		# int() the min — GDScript min() may hand back a float.
 		return [_pattern_textures[int(min(pattern, _pattern_textures.size() - 1))], false, false]
@@ -1043,7 +1075,7 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 				# Custom = the user's own image, pre-thresholded to the binary
 				# contract at load; a missing/unloadable file degrades to a
 				# plain opening rather than sealing or streaking the beam.
-				var resolved = _portal_pattern_texture(portal, pcfg)
+				var resolved = _projector_pattern_texture(portal, pcfg)
 				var pattern_tex = resolved[0]
 				if resolved[1]:
 					custom_used += 1
@@ -1068,7 +1100,7 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 				var v1 = (d1 * tan_c) / tile_px
 				quads += _add_quad(root, a, b, dirv, d0, d1,
 					pattern_tex,
-					span_tiles, v0, v1,
+					0.0, span_tiles, v0, v1,
 					{"tan_lo": tan_lo, "tan_hi": tan_hi,
 					"h_bottom_px": h_b, "h_top_px": h_t, "h_wall_px": h_w,
 					"d0_px": d0, "d1_px": d1,
@@ -1147,6 +1179,28 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 	var no_pattern = 0
 	var collapsed = 0
 	var degenerate = 0
+	# The emitter line for an object source runs square-on to the sun, so both
+	# it and the silhouette measurement live in this basis. dirv is unit
+	# (get_shadow_direction normalises) and perp is its left normal, so the pair
+	# is orthonormal — which is what lets the next step rebuild a world point
+	# from two dot products.
+	var perp = Vector2(-dirv.y, dirv.x)
+	# objects_seen counts objects ENTERED, before any of the four skip paths;
+	# objects_drawn counts the ones that reached _add_quad. They must be reported
+	# separately: the success line used to print objects_seen, so one projecting
+	# portal beside an object that failed to measure logged "1 quad(s) built ...
+	# 1 from object(s)" — an assertion that the object had contributed, on the
+	# one diagnostic the owner has.
+	var objects_seen = 0
+	var objects_drawn = 0
+	# Two DIFFERENT diagnoses, kept apart deliberately. measure_failed is a
+	# per-asset outcome — this prop's sprite could not be measured, a normal
+	# thing for an odd asset. silhouette_missing means Silhouette.gd never
+	# loaded, so NO object can cast anything: an install fault, and reachable at
+	# all only since Core stopped treating that load failure as fatal. Merged,
+	# the log would blame the asset for a missing file.
+	var measure_failed = 0
+	var silhouette_missing = 0
 
 	for g in _groups:
 		var root = g.get("proj_root")
@@ -1157,6 +1211,147 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 			child.queue_free()
 		for caster in height_field.get_group_casters(g["slot"]):
 			if caster == null or not is_instance_valid(caster):
+				continue
+			# OBJECT SOURCE, taken before the portal scan and `continue`d out of:
+			# an object has no portals, and asking for a prop's is pure cost.
+			#
+			# TRACED mode emits ONE quad covering everywhere the shadow can land
+			# and lets TracedShadow.shader decide each pixel, by walking back
+			# along the sun through the object's own art. Nothing is cut away
+			# anywhere, so a projecting object standing in another's shadow
+			# cannot punch a hole in it. PROFILE mode emits one quad too,
+			# carrying the authored image as a single picture.
+			#
+			# The coordinate reconstructions are the lines worth reading twice.
+			# m["lead"], m["trail"], m["lo"] and m["hi"] are DOT PRODUCTS in
+			# world space, not offsets from the object: because dirv and perp are
+			# orthonormal, dirv*d + perp*c rebuilds exactly the world point whose
+			# downsun coordinate is d and whose sideways coordinate is c. That is
+			# why the quad lands on the art even for an asset drawn well off
+			# centre in its texture, where the node origin would not — and it is
+			# why an emitter passed to _add_quad carries no d0: _add_quad adds
+			# dirv*d0 to it.
+			if path_tagging.is_object_projecting(caster):
+				objects_seen += 1
+				var ocfg = path_tagging.get_object_cfg(caster)
+				var ores = _projector_pattern_texture(caster, ocfg)
+				var otex = ores[0]
+				if otex == null:
+					no_pattern += 1
+					continue
+				if silhouette == null:
+					silhouette_missing += 1
+					continue
+				var o_bot = float(ocfg.get("bottom", 0.0))
+				var o_top = max(float(ocfg.get("top", 8.0)), o_bot)
+				if o_top <= o_bot + 0.01:
+					collapsed += 1
+					continue
+				var o_h_b = (o_bot / fps) * tier_px
+				var o_h_t = (o_top / fps) * tier_px
+				var o_d0 = o_h_b / tan_hi
+				var o_d1 = min(o_h_t / max(0.02, tan_lo), d_cap)
+				if o_d1 <= o_d0 + 1.0:
+					degenerate += 1
+					continue
+				var o_prof = int(ocfg.get("cast_mode", 0)) == 1
+				# Extent only, for both modes: Profile lands its authored image
+				# across it, and Traced hands it to the shader as the quad to
+				# march inside. Neither wants the shape broken into columns.
+				var m = silhouette.profile(caster, dirv, perp)
+				if m == null:
+					measure_failed += 1
+					continue
+				var o_lo = float(m["lo"])
+				var o_hi = float(m["hi"])
+				var o_mid = (o_lo + o_hi) * 0.5
+				var o_raw = max(1.0, o_hi - o_lo)
+				var o_w = max(o_raw + (float(ocfg.get("width_adjust", 0.0)) / fps) * tier_px,
+					MIN_EMITTER_PX)
+				# The adjust SCALES about the centre rather than padding each
+				# side: TracedShadow.shader's unscale is the exact inverse of a
+				# scale about this same centre, and a pad would need a
+				# different inverse.
+				var o_scale = o_w / o_raw
+				var o_tile_px = (max(0.5, float(ocfg.get("tile", 2.5))) / fps) * tier_px
+				var o_params = {"tan_lo": tan_lo, "tan_hi": tan_hi,
+					"h_bottom_px": o_h_b, "h_top_px": o_h_t,
+					"d0_px": o_d0, "d1_px": o_d1,
+					"has_pattern": 1.0}
+				var o_drew = 0
+				if o_prof:
+					# ONE strip through the middle of the art — for a top-down
+					# tree that is the trunk, which is where a real shadow
+					# starts. u and v both run 0..1, so the image maps ONCE and
+					# therefore stretches over h_top/tan(altitude): exactly what
+					# a real shadow does, lengthening and shortening with the
+					# sun. v runs 1 -> 0 so an image authored the natural way,
+					# base at the bottom, lands base-at-the-trunk: UV.y 0 is the
+					# texture's TOP row in Godot, so the near edge — the one at
+					# the trunk — must be the v == 1 end.
+					#
+					# NO o_d0 in the emitter: _add_quad adds dirv*d0 itself.
+					var o_md = (float(m["trail"]) + float(m["lead"])) * 0.5
+					var o_pa = dirv * o_md + perp * (o_mid + (o_lo - o_mid) * o_scale)
+					var o_pb = dirv * o_md + perp * (o_mid + (o_hi - o_mid) * o_scale)
+					o_drew = _add_quad(root, o_pa, o_pb, dirv, o_d0, o_d1,
+						otex, 0.0, 1.0, 1.0, 0.0, o_params, _projection_shader)
+				else:
+					# TRACED. ONE quad covering everywhere the shadow can land,
+					# with the shader asking the actual question per pixel:
+					# walking back along the sun from this ground point, does the
+					# ray pass through the object's art? See TracedShadow.shader.
+					#
+					# It replaced one strip per silhouette column, which streaked
+					# badly on screen: every strip faded from ITS OWN column's
+					# edge, so two neighbours covering the same ground computed
+					# different darkness and each seam became a visible step.
+					# One surface cannot have that problem.
+					if _traced_shader == null:
+						measure_failed += 1
+						continue
+					var o_map = silhouette.object_uv_map(caster)
+					if o_map == null:
+						measure_failed += 1
+						continue
+					var o_edge_lo = o_mid + (o_lo - o_mid) * o_scale
+					var o_edge_hi = o_mid + (o_hi - o_mid) * o_scale
+					var o_trail = float(m["trail"])
+					var o_lead = float(m["lead"])
+					# t_min is floored at 1 because the coverage divides by it.
+					var o_tmin = max(1.0, o_d0)
+					var o_tmax = max(o_tmin + 1.0, o_d1)
+					# From the object's BACK edge to its front edge plus the
+					# shadow's full reach: everywhere a hit could possibly land.
+					# o_tmax and NOT o_d1 — the two differ only when the band is
+					# nearly degenerate, and a quad shorter than the march would
+					# clip the shadow's tail against nothing.
+					var o_span = (o_lead - o_trail) + o_tmax
+					var o_qa = dirv * o_trail + perp * o_edge_lo
+					var o_qb = dirv * o_trail + perp * o_edge_hi
+					# About one sample per 4 world px, bounded. Features thinner
+					# than the step can be stepped over — see the spec's limit 1.
+					# The 48 is MAX_STEPS in TracedShadow.shader; raising it here
+					# alone would silently truncate the march at 48.
+					var o_steps = int(clamp(ceil((o_tmax - o_tmin) / 4.0), 8.0, 48.0))
+					o_drew = _add_quad(root, o_qa, o_qb, dirv, 0.0, o_span,
+						otex, 0.0, 1.0, 0.0, 1.0,
+						{"quad_o": o_qa, "quad_u": o_qb - o_qa,
+						"quad_v": dirv * o_span,
+						"sun_dir": dirv, "perp_dir": perp,
+						"t_min": o_tmin, "t_max": o_tmax, "steps": o_steps,
+						"tan_lo": tan_lo, "tan_hi": tan_hi,
+						"h_bottom_px": o_h_b, "h_top_px": o_h_t,
+						"obj_tex": o_map["tex"], "obj_ix": o_map["ix"],
+						"obj_iy": o_map["iy"], "obj_io": o_map["io"],
+						"width_scale": o_scale, "width_mid": o_mid,
+						"alpha_cut": silhouette.ALPHA_VISIBLE,
+						"tile_px": o_tile_px, "tan_c": tan_c,
+						"u_origin": o_edge_lo, "v_origin": o_lead},
+						_traced_shader)
+				quads += o_drew
+				if o_drew > 0:
+					objects_drawn += 1
 				continue
 			var cfg = path_tagging.get_config(caster)
 			var wall_ft = float(cfg.get("height", 1.0)) * fps
@@ -1178,7 +1373,7 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 				# wall tripped the clamp's level-0 "raise the wall's Height" line
 				# — repeated on every settled sun/Strength change, telling the
 				# user to fix something that would draw nothing either way.
-				var resolved = _portal_pattern_texture(portal, pcfg)
+				var resolved = _projector_pattern_texture(portal, pcfg)
 				var pattern_tex = resolved[0]
 				if pattern_tex == null:
 					no_pattern += 1
@@ -1219,25 +1414,34 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 				var v0 = (d0 * tan_c) / tile_px
 				var v1 = (d1 * tan_c) / tile_px
 				quads += _add_quad(root, a, b, dirv, d0, d1,
-					pattern_tex, span_tiles, v0, v1,
+					pattern_tex, 0.0, span_tiles, v0, v1,
 					{"tan_lo": tan_lo, "tan_hi": tan_hi,
 					"h_bottom_px": h_b, "h_top_px": h_t,
 					"d0_px": d0, "d1_px": d1,
 					"has_pattern": 1.0},
 					_projection_shader)
-	# Logged whenever the feature is ENGAGED at all (a group allocated a
-	# projection root), not only when something was drawn. The old `quads > 0`
-	# gate made the most likely owner-facing failure — ticked the switch, saw
-	# nothing — completely silent.
+	# Two INDEPENDENT lines, not an if/elif pair. Something drawing and something
+	# failing are not mutually exclusive, and the log is this project's only test
+	# harness: a run where a portal drew and an object did not must say both.
 	if quads > 0:
-		# Leading text shape preserved: it doubles as a reload canary.
-		outputlog("projected patterns: %d quad(s) built, %d clamped by wall height" % [quads, clamped], 1)
-	elif roots > 0:
-		# Level 0: this IS the diagnostic. Says which skip swallowed the portals.
-		outputlog(("projected patterns: 0 quad(s) built from %d projecting portal(s) in %d group(s)" +
-			" — %d skipped: no Light pattern (a plain opening casts nothing), %d collapsed band" +
-			" (top <= bottom), %d degenerate footprint") % [
-			portals, roots, no_pattern, collapsed, degenerate], 0)
+		# Leading text shape preserved: it doubles as a reload canary, and the
+		# owner greps for it. objects_drawn, NOT objects_seen — see above.
+		outputlog("projected patterns: %d quad(s) built, %d clamped by wall height, from %d object(s)" % [
+			quads, clamped, objects_drawn], 1)
+	# Level 0: this IS the diagnostic. Printed whenever nothing drew at all AND
+	# whenever an object was entered but did not draw, so a PARTIAL failure is
+	# never silent. The old `elif` meant any other source drawing suppressed it
+	# entirely: a projecting portal beside a failing object hid every counter
+	# that said why, and finding out cost a Dungeondraft restart. The opening
+	# text deliberately differs from the canary above so grepping it stays exact.
+	if (quads == 0 and roots > 0) or objects_seen > objects_drawn:
+		outputlog(("projected pattern sources: %d of %d projecting object(s) drew, alongside " +
+			"%d projecting portal(s) in %d group(s), %d quad(s) total — skipped: %d no pattern " +
+			"picked (nothing to cast), %d collapsed band (top <= bottom), %d degenerate " +
+			"footprint, %d unmeasurable silhouette, %d with Silhouette.gd not loaded " +
+			"(object patterns disabled)") % [
+			objects_drawn, objects_seen, portals, roots, quads,
+			no_pattern, collapsed, degenerate, measure_failed, silhouette_missing], 0)
 
 # A black MUL polygon in the beam mask: multiplies the white base (and any
 # beam quads) to 0 inside the region. Vertex colours are already black; the
@@ -1251,13 +1455,15 @@ func _add_black_mesh(root, mesh):
 	root.add_child(mi)
 
 # One projected parallelogram: span a..b extruded along `dirv` from d0 to d1.
-# UVs tile the pattern across the span (u) and up the opening face (v).
+# UVs are given as RANGES: u0..u1 across the span, v0..v1 up the opening face.
+# All four callers pass a single quad's own u/v range; there is no caller left
+# that tiles several quads across a shared range.
 # COLOR.g interpolates 0 -> 1 from the near to the far edge (the shader
 # recovers d from it), so the mesh must keep FLOAT vertex colours: compress
 # flags 0 — the default ARRAY_COMPRESS_COLOR would quantise the interpolant
 # to 8 bits and band the penumbra ramps.
 func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float,
-	tex, u_tiles: float, v0: float, v1: float, params: Dictionary, shader) -> int:
+	tex, u0: float, u1: float, v0: float, v1: float, params: Dictionary, shader) -> int:
 
 	var p0 = a + dirv * d0
 	var p1 = b + dirv * d0
@@ -1266,8 +1472,8 @@ func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float
 
 	var verts = PoolVector2Array([p0, p1, p2, p0, p2, p3])
 	var uvs = PoolVector2Array([
-		Vector2(0, v0), Vector2(u_tiles, v0), Vector2(u_tiles, v1),
-		Vector2(0, v0), Vector2(u_tiles, v1), Vector2(0, v1)])
+		Vector2(u0, v0), Vector2(u1, v0), Vector2(u1, v1),
+		Vector2(u0, v0), Vector2(u1, v1), Vector2(u0, v1)])
 	var c0 = Color(1, 0, 1, 1)
 	var c1 = Color(1, 1, 1, 1)
 	var colors = PoolColorArray([c0, c0, c1, c0, c1, c1])
@@ -1311,15 +1517,19 @@ func _group_needs_beam_mask(slot: int) -> bool:
 			return true
 	return false
 
-# Does this layer group carry any projecting portal? Unlike the beam mask this
-# has nothing to do with the caster's side or whether the portal is open — a
-# closed door on a wall that casts nothing still projects.
+# Does this layer group carry any projecting SOURCE — a projecting object, or a
+# wall with a projecting portal? Both allocate the group's proj_vp, and the
+# object test comes first because an object has no portals to scan. Unlike the
+# beam mask this has nothing to do with the caster's side or whether the portal
+# is open — a closed door on a wall that casts nothing still projects.
 func _group_needs_projection(slot: int) -> bool:
 	if _projection_shader == null:
 		return false
 	for caster in height_field.get_group_casters(slot):
 		if caster == null or not is_instance_valid(caster):
 			continue
+		if path_tagging.is_object_projecting(caster):
+			return true
 		for portal in height_field.get_all_wall_portals(caster):
 			if path_tagging.is_portal_projecting(portal):
 				return true

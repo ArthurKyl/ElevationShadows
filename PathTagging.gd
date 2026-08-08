@@ -130,11 +130,44 @@ const PORTAL_DEFAULTS = {
 	"project": false,
 }
 
+# Per-object pattern projection (object store, keyed by node_id). The same
+# opening model portals use — a band from `bottom` to `top` in the object's
+# face, shaped by `pattern` — plus `width_adjust`, because an object has no
+# opening span to take its width from and the silhouette supplies it instead.
+const OBJECT_DEFAULTS = {
+	"project": false,
+	"pattern": 0,        # index into PATTERN_NAMES, or PATTERN_CUSTOM; 0 = nothing to cast
+	"pattern_file": "",  # image path for PATTERN_CUSTOM, a plain STRING like the portal's
+	"top": 8.0,          # ft — where the patterned part ends
+	"bottom": 0.0,       # ft — where it starts, off the ground
+	"tile": 2.5,         # ft — one bar / pane / plus per this many feet
+	# ft, SIGNED. The emitter is measured from the asset's alpha silhouette; this
+	# widens or narrows that measurement. 0 = cast exactly what the art is.
+	"width_adjust": 0.0,
+	# 0 = Traced: one strip per column of the artwork's silhouette, pattern
+	#     tiled. The shadow is the silhouette swept along the sun.
+	# 1 = Profile: ONE strip through the middle of the art, the image mapped
+	#     once and stretched over h/tan(altitude) — for an authored side view,
+	#     e.g. a tree's profile cast from its top-down asset.
+	"cast_mode": 0,
+}
+
 const PATTERN_NAMES = ["None (open)", "Bars", "Window panes", "Diamond lattice", "Plus holes", "Checker"]
 # One past the generated patterns: the "Custom texture..." OptionButton entry.
 # Arthur's contract for custom images: any texel with non-0% opacity blocks
 # light at 100% (enforced by ShadowRenderer's load-time threshold).
 const PATTERN_CUSTOM = 6
+# A fully opaque pattern: the object casts an ordinary, unpatterned shadow.
+# APPENDED past PATTERN_CUSTOM, never inserted: these indices are stored in
+# saved maps, so renumbering would silently turn every existing Custom-texture
+# portal into something else.
+const PATTERN_SOLID = 7
+
+# The same indices as PATTERN_NAMES, worded for an object rather than a portal
+# opening — "None (open)" reads wrong on a crate. Display only; the stored
+# values are identical.
+const OBJECT_PATTERN_NAMES = ["None (no shadow)", "Bars", "Window panes",
+	"Diamond lattice", "Plus holes", "Checker"]
 
 var pt_ui = {}      # PathTool controls (defaults for new paths)
 var st_ui = {}      # SelectTool controls (edits current selection)
@@ -150,6 +183,11 @@ var _current_portal = null
 # Custom-pattern image picker (lazy singleton) and the portal it was opened for.
 var _pattern_file_dialog = null
 var _pattern_file_portal = null
+var _current_object = null
+# The object panel's own picker and the object it was opened for. A SECOND
+# dialog rather than a shared one — see _make_pattern_file_dialog in Step 5.
+var _object_file_dialog = null
+var _pattern_file_object = null
 
 func outputlog(msg, level = 0):
 	if core != null:
@@ -325,11 +363,14 @@ func get_projecting_portal_entries() -> Array:
 		out.append({"portal": portal, "wall": wall})
 	return out
 
-# Walls that exist ONLY to host a projecting portal: living, visible, on this
-# level, and NOT already enabled casters (an enabled caster is in the group
-# anyway, and promoting it twice would duplicate it). These join their layer's
-# group so a ghost prop exists to draw onto, and contribute nothing else.
-func get_projector_walls() -> Array:
+# Nodes that exist in a layer group ONLY to host a projector: living, visible,
+# on this level, and NOT already enabled casters. They join their layer's group
+# so a ghost prop exists to draw onto, and contribute nothing else.
+#
+# A projecting PORTAL promotes its host WALL. A projecting OBJECT promotes
+# ITSELF — there is nothing else to promote, and an object is never an enabled
+# caster, so it can only ever arrive here.
+func get_projector_nodes() -> Array:
 	var out = []
 	var seen = {}
 	var store = _get_store()
@@ -346,6 +387,81 @@ func get_projector_walls() -> Array:
 			continue
 		seen[wnid] = true
 		out.append(wall)
+	# get_projecting_objects already filters to valid, visible, current-level.
+	for obj in get_projecting_objects():
+		var onid = core.get_node_id(obj)
+		if onid == null or seen.has(onid):
+			continue
+		if store.has(onid) and store[onid] is Dictionary and store[onid].get("enabled", false):
+			continue
+		seen[onid] = true
+		out.append(obj)
+	return out
+
+#########################################################################################################
+## OBJECT PATTERN PROJECTION — the same opening model, cast from an object
+#########################################################################################################
+
+func _get_object_store() -> Dictionary:
+	if not global.ModMapData.has(core.OBJECT_KEY):
+		global.ModMapData[core.OBJECT_KEY] = {}
+	return global.ModMapData[core.OBJECT_KEY]
+
+func get_object_cfg(node) -> Dictionary:
+	var cfg = OBJECT_DEFAULTS.duplicate()
+	var nid = core.get_node_id(node)
+	if nid != null:
+		var store = _get_object_store()
+		if store.has(nid) and store[nid] is Dictionary:
+			for k in store[nid].keys():
+				cfg[k] = store[nid][k]
+	return cfg
+
+func set_object_value(node, key: String, value):
+	var nid = core.get_node_id(node)
+	if nid == null:
+		outputlog("Cannot store object setting: no node_id", 0)
+		return
+	var store = _get_object_store()
+	if not (store.has(nid) and store[nid] is Dictionary):
+		store[nid] = {}
+	store[nid][key] = value
+	outputlog("object %s: %s = %s" % [nid, key, str(value)], 1)
+	# Pattern, band, tile and width only reshape the projected quad, which is
+	# rebuilt in update_uniforms. "project" is separate and asks for the field
+	# itself, because turning it on can create a whole layer group.
+	if core != null:
+		core.request_rebuild(true, false)
+
+func is_object_projecting(node) -> bool:
+	var nid = core.get_node_id(node)
+	if nid == null:
+		return false
+	var store = _get_object_store()
+	if store.has(nid) and store[nid] is Dictionary:
+		return bool(store[nid].get("project", false))
+	return false
+
+# Every projecting object on the CURRENT level, valid and visible. Driven by the
+# object store, exactly as the portal equivalent is driven by the portal store —
+# an object is never an "enabled caster", so the caster store would never find it.
+func get_projecting_objects() -> Array:
+	var out = []
+	var store = _get_object_store()
+	var level = global.World.GetCurrentLevel()
+	for nid in store.keys():
+		if not (store[nid] is Dictionary and bool(store[nid].get("project", false))):
+			continue
+		if not global.World.HasNodeID(nid):
+			continue
+		var node = global.World.GetNodeByID(nid)
+		if node == null or not is_instance_valid(node):
+			continue
+		if level != null and not _is_descendant_of(node, level):
+			continue
+		if node.has_method("is_visible_in_tree") and not node.is_visible_in_tree():
+			continue
+		out.append(node)
 	return out
 
 func get_config(node) -> Dictionary:
@@ -472,6 +588,41 @@ func get_caster_layer(node) -> float:
 		walker = walker.get_parent()
 		guard += 1
 	return float(z)
+
+# The Sprite a projecting object is measured from, or null. MUST match
+# Silhouette._get_sprite exactly — get("Sprite") first, then a child scan — or
+# the fingerprint would hash one sprite while the renderer measured another, and
+# the selection gate would offer the panel for a node the renderer cannot use.
+# Duplicated inline twice before this was extracted; keep it in one place.
+# (Deliberately NOT reached through `silhouette`: PathTagging has no dependency
+# on that unit, and the method there is private.)
+func find_object_sprite(node):
+	if node == null or not is_instance_valid(node):
+		return null
+	var spr = node.get("Sprite")
+	if spr != null and is_instance_valid(spr):
+		return spr
+	for child in node.get_children():
+		if child is Sprite:
+			return child
+	return null
+
+# Can this node plausibly cast a pattern at all? Selection identifies an object
+# by elimination (not a path, not a portal), which sweeps in lights, texts,
+# roofs, scatter, pattern shapes and the mod's OWN ghost shadow prop. Offering
+# them the switch would promote them to projector-only casters — a layer group,
+# a ghost prop and a projection viewport allocated for something that can never
+# draw — and the sprite child-scan could latch onto an editor gizmo's Sprite and
+# cast a pattern measured from an editor icon. Two requirements:
+#   - a node_id, because the settings are stored under it. The mod's ghost prop
+#     deliberately carries none, so this excludes it by construction.
+#   - a Sprite found the way the renderer will look for it.
+func can_cast_object_pattern(node) -> bool:
+	if node == null or not is_instance_valid(node):
+		return false
+	if core.get_node_id(node) == null:
+		return false
+	return find_object_sprite(node) != null
 
 # Cheap change-detector over the enabled caster set, polled by Core. Nothing in
 # DD announces "a path was deleted" (or un-deleted, hidden, moved, re-layered,
@@ -614,6 +765,32 @@ func caster_fingerprint() -> int:
 			+ int(float(pcfg.get("top", 8.0)) * 10.0) * 31
 			+ int(float(pcfg.get("tile", 2.5)) * 10.0) * 71
 			+ int(pcfg.get("pattern", 0)) * 131) % 0x7FFFFFFF
+	# PROJECTING OBJECTS. Objects are dragged, turned and RESIZED constantly, and
+	# all three land in the sprite's global transform — which is exactly what
+	# Silhouette.profile consumes, so that is what gets hashed.
+	for obj in get_projecting_objects():
+		var ocfg = get_object_cfg(obj)
+		h = int(h * 31 + str(core.get_node_id(obj)).hash()) % 0x7FFFFFFF
+		h = int(h * 31 + int(get_caster_layer(obj))) % 0x7FFFFFFF
+		# Via the shared helper, so the fingerprint can never diverge from which
+		# sprite the renderer will actually measure.
+		var spr = find_object_sprite(obj)
+		if spr != null:
+			var xf = spr.get_global_transform()
+			h = int(h * 31 + int(xf.origin.x * 0.53 + xf.origin.y * 0.29)) % 0x7FFFFFFF
+			h = int(h * 31 + int(xf.x.x * 97.0 + xf.x.y * 61.0
+				+ xf.y.x * 41.0 + xf.y.y * 23.0)) % 0x7FFFFFFF
+		h = int(h * 31 + int(float(ocfg.get("bottom", 0.0)) * 10.0)
+			+ int(float(ocfg.get("top", 8.0)) * 10.0) * 31
+			+ int(float(ocfg.get("tile", 2.5)) * 10.0) * 71
+			+ int(float(ocfg.get("width_adjust", 0.0)) * 10.0) * 97
+			+ int(ocfg.get("pattern", 0)) * 131
+			# cast_mode picks Traced vs Profile, which is a completely
+			# different emitter. Its toggle asks for a rebuild directly, so
+			# this is not a live bug — but `pattern` is hashed for exactly
+			# that same reason and travels the same set_object_value path,
+			# and leaving one of the pair out is a trap for the next edit.
+			+ int(ocfg.get("cast_mode", 0)) * 181) % 0x7FFFFFFF
 	return h
 
 # Effective "Art above shadow" for a path: the stored value if the user set it,
@@ -762,6 +939,28 @@ func _build_path_tool_ui():
 
 	align.add_child(container)
 	outputlog("PathTool UI added", 0)
+
+# A label + SpinBox row. The object panel has four of these and they differ only
+# in text and range, so they are built rather than written out four times.
+func _add_spin_row(container, text: String, tooltip: String, lo: float, hi: float,
+	step: float, value: float, callback: String) -> SpinBox:
+
+	var row = HBoxContainer.new()
+	var label = Label.new()
+	label.text = text
+	label.rect_min_size = Vector2(104, 0)
+	label.hint_tooltip = tooltip
+	row.add_child(label)
+	var spin = SpinBox.new()
+	spin.min_value = lo
+	spin.max_value = hi
+	spin.step = step
+	spin.value = value
+	spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	spin.connect("value_changed", self, callback)
+	row.add_child(spin)
+	container.add_child(row)
+	return spin
 
 func _build_select_tool_ui():
 	var panel = global.Editor.Toolset.GetToolPanel("SelectTool")
@@ -1035,6 +1234,105 @@ func _build_select_tool_ui():
 	st_ui["portal_container"] = pcontainer
 	st_ui["portal_open"] = ptoggle
 
+	# Object section, shown when a plain object is selected. Same opening model
+	# as a portal — a band in the object's face, shaped by a pattern — cast from
+	# a line measured across the object's own alpha silhouette.
+	var ocontainer = VBoxContainer.new()
+	ocontainer.name = "ElevationShadowsObjectTool"
+	ocontainer.visible = false
+	ocontainer.add_child(HSeparator.new())
+
+	var orow = HBoxContainer.new()
+	var olabel = Label.new()
+	olabel.text = "Cast pattern shadow"
+	olabel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	olabel.hint_tooltip = ("Cast this object's chosen pattern onto the ground, as if the\n" +
+		"object blocked the sun in that shape. The shadow is as wide as\n" +
+		"the object's own artwork, square-on to the sun, and swings as\n" +
+		"the sun turns. Needs a Pattern below — with none picked there\n" +
+		"is nothing to cast.")
+	orow.add_child(olabel)
+	var otoggle = CheckButton.new()
+	otoggle.connect("toggled", self, "_on_st_object_project_toggled")
+	orow.add_child(otoggle)
+	ocontainer.add_child(orow)
+	st_ui["object_project"] = otoggle
+
+	var omode_row = HBoxContainer.new()
+	var omode_label = Label.new()
+	omode_label.text = "Cast mode"
+	omode_label.rect_min_size = Vector2(104, 0)
+	omode_label.hint_tooltip = ("Traced: the shadow is this object's own outline swept along\n" +
+		"the sun, with the pattern tiled into it — a crate, a cage, a grate.\n" +
+		"Profile: your image is cast ONCE, standing up from the middle of\n" +
+		"the object and stretched along the ground — draw a tree from the\n" +
+		"side and cast it from a top-down tree.")
+	omode_row.add_child(omode_label)
+	var omode_option = OptionButton.new()
+	omode_option.add_item("Traced")   # 0
+	omode_option.add_item("Profile")  # 1
+	omode_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	omode_option.connect("item_selected", self, "_on_st_object_cast_mode_selected")
+	omode_row.add_child(omode_option)
+	ocontainer.add_child(omode_row)
+	st_ui["object_mode"] = omode_option
+
+	var opat_row = HBoxContainer.new()
+	var opat_label = Label.new()
+	opat_label.text = "Pattern"
+	opat_label.rect_min_size = Vector2(104, 0)
+	opat_label.hint_tooltip = ("Shape of the shadow this object casts: bars, panes, lattice...\n" +
+		"or your own image. It skews and stretches with the sun.")
+	opat_row.add_child(opat_label)
+	var opat_option = OptionButton.new()
+	for pname in OBJECT_PATTERN_NAMES:
+		opat_option.add_item(pname)
+	opat_option.add_item("Custom texture...")  # index == PATTERN_CUSTOM
+	opat_option.add_item("Solid")              # index == PATTERN_SOLID
+	opat_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	opat_option.connect("item_selected", self, "_on_st_object_pattern_selected")
+	opat_row.add_child(opat_option)
+	ocontainer.add_child(opat_row)
+	st_ui["object_pattern"] = opat_option
+
+	var ocust_row = HBoxContainer.new()
+	var ocust_btn = Button.new()
+	ocust_btn.text = "Image..."
+	ocust_btn.hint_tooltip = ("Pick a PNG/WebP whose alpha is the pattern: any pixel with\n" +
+		"non-0% opacity blocks the light completely, fully transparent\n" +
+		"pixels let it through. Tiles at the Pattern size below.")
+	ocust_btn.connect("pressed", self, "_on_st_object_pattern_file_pressed")
+	ocust_row.add_child(ocust_btn)
+	var ocust_label = Label.new()
+	ocust_label.text = "(no image)"
+	ocust_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ocust_label.clip_text = true
+	ocust_label.modulate = Color(1, 1, 1, 0.6)
+	ocust_row.add_child(ocust_label)
+	ocust_row.visible = false
+	ocontainer.add_child(ocust_row)
+	st_ui["object_custom_row"] = ocust_row
+	st_ui["object_custom_label"] = ocust_label
+
+	st_ui["object_tile"] = _add_spin_row(ocontainer, "Pattern size (ft)",
+		"One bar / pane / plus per this many feet.",
+		0.5, 20.0, 0.25, 2.5, "_on_st_object_tile_changed")
+	st_ui["object_top"] = _add_spin_row(ocontainer, "Shadow top (ft)",
+		"How high up the object the pattern reaches. Taller = a longer\n" +
+		"shadow, exactly as a taller wall casts further.",
+		0.5, 240.0, 0.5, 8.0, "_on_st_object_top_changed")
+	st_ui["object_bottom"] = _add_spin_row(ocontainer, "Shadow bottom (ft)",
+		"How far off the ground the pattern starts. 0 for something\n" +
+		"standing on the floor; raise it for something hanging.",
+		0.0, 239.0, 0.5, 0.0, "_on_st_object_bottom_changed")
+	st_ui["object_width"] = _add_spin_row(ocontainer, "Width adjust (ft)",
+		"The shadow is already as wide as the object's own artwork.\n" +
+		"This widens (+) or narrows (-) it. 0 = cast exactly the art.",
+		-100.0, 100.0, 0.5, 0.0, "_on_st_object_width_changed")
+
+	align.add_child(ocontainer)
+	st_ui["object_container"] = ocontainer
+
 	outputlog("SelectTool UI added", 0)
 
 #########################################################################################################
@@ -1059,11 +1357,20 @@ func on_selection_changed():
 	var selected = global.Editor.Tools["SelectTool"].Selected
 	var path = null
 	var portal = null
+	var object = null
 	for node in selected:
 		if path == null and core.is_path_node(node):
 			path = node
 		elif portal == null and core.is_portal_node(node):
 			portal = node
+		# The object arm is identification by ELIMINATION, so it must be gated:
+		# can_cast_object_pattern keeps lights, texts, roofs, scatter, pattern
+		# shapes and the mod's own ghost prop out of the panel. Gated LAST — it
+		# scans children, and the two cheap type tests reject most nodes first.
+		# A rejected node simply leaves the container hidden, with no log:
+		# selecting a light is a perfectly normal thing to do.
+		elif object == null and not core.is_path_node(node) and not core.is_portal_node(node) and can_cast_object_pattern(node):
+			object = node
 
 	_current_portal = portal
 	if st_ui.has("portal_container"):
@@ -1079,6 +1386,22 @@ func on_selection_changed():
 				st_ui["portal_bottom"].value = float(pcfg.get("bottom", 0.0))
 				st_ui["portal_tile"].value = float(pcfg.get("tile", 2.5))
 				_update_custom_pattern_row(pcfg)
+			_syncing = false
+
+	_current_object = object
+	if st_ui.has("object_container"):
+		st_ui["object_container"].visible = object != null
+		if object != null:
+			var ocfg = get_object_cfg(object)
+			_syncing = true
+			st_ui["object_project"].pressed = bool(ocfg.get("project", false))
+			st_ui["object_mode"].selected = int(ocfg.get("cast_mode", 0))
+			st_ui["object_pattern"].selected = int(ocfg.get("pattern", 0))
+			st_ui["object_tile"].value = float(ocfg.get("tile", 2.5))
+			st_ui["object_top"].value = float(ocfg.get("top", 8.0))
+			st_ui["object_bottom"].value = float(ocfg.get("bottom", 0.0))
+			st_ui["object_width"].value = float(ocfg.get("width_adjust", 0.0))
+			_update_object_custom_row(ocfg)
 			_syncing = false
 
 	_current_path = path
@@ -1186,32 +1509,72 @@ func _on_st_portal_pattern_file_pressed():
 		return
 	_open_pattern_file_dialog()
 
-# A plain Godot FileDialog over the filesystem (created once, reused). DD has
-# no reusable asset-browser dialog surfaced to mods, and the pattern image is
-# a mod-side resource anyway — it never needs to live in an asset pack.
+# A plain Godot FileDialog over the filesystem, created lazily and then reused.
+# DD has no reusable asset-browser dialog surfaced to mods, and the pattern image
+# is a mod-side resource anyway — it never needs to live in an asset pack.
+#
+# Built through a factory because the OBJECT panel gets its OWN instance. A
+# FileDialog's "file_selected" is connected once, at construction, so a single
+# shared dialog would have to carry a "which panel asked?" flag, every entry
+# point would have to set it, and getting it wrong drops the user's image onto
+# the wrong node in silence. Two dialogs, two handlers, nothing to desync.
+func _make_pattern_file_dialog(handler: String, title: String) -> FileDialog:
+	var dlg = FileDialog.new()
+	dlg.mode = FileDialog.MODE_OPEN_FILE
+	dlg.access = FileDialog.ACCESS_FILESYSTEM
+	dlg.window_title = title
+	dlg.resizable = true
+	dlg.rect_min_size = Vector2(700, 500)
+	dlg.filters = PoolStringArray([
+		"*.png ; PNG images", "*.webp ; WebP images",
+		"*.jpg, *.jpeg ; JPEG images (no alpha — blocks everywhere)",
+		"*.bmp ; BMP images", "*.tga ; TGA images"])
+	dlg.connect("file_selected", self, handler)
+	# Start somewhere sane; the dialog keeps its last directory afterwards.
+	var home = OS.get_environment("HOME")
+	if home != "":
+		dlg.current_dir = home
+	global.Editor.add_child(dlg)
+	return dlg
+
 func _open_pattern_file_dialog():
 	if _pattern_file_dialog == null or not is_instance_valid(_pattern_file_dialog):
-		var dlg = FileDialog.new()
-		dlg.mode = FileDialog.MODE_OPEN_FILE
-		dlg.access = FileDialog.ACCESS_FILESYSTEM
-		dlg.window_title = "Light pattern image (alpha > 0 blocks light)"
-		dlg.resizable = true
-		dlg.rect_min_size = Vector2(700, 500)
-		dlg.filters = PoolStringArray([
-			"*.png ; PNG images", "*.webp ; WebP images",
-			"*.jpg, *.jpeg ; JPEG images (no alpha — blocks everywhere)",
-			"*.bmp ; BMP images", "*.tga ; TGA images"])
-		dlg.connect("file_selected", self, "_on_st_portal_pattern_file_selected")
-		# Start somewhere sane; the dialog keeps its last directory afterwards.
-		var home = OS.get_environment("HOME")
-		if home != "":
-			dlg.current_dir = home
-		global.Editor.add_child(dlg)
-		_pattern_file_dialog = dlg
+		_pattern_file_dialog = _make_pattern_file_dialog(
+			"_on_st_portal_pattern_file_selected",
+			"Light pattern image (alpha > 0 blocks light)")
 	# The dialog outlives the selection — remember whose portal it was opened
 	# for, so a selection change while it is up cannot retarget the pick.
 	_pattern_file_portal = _current_portal
 	_pattern_file_dialog.popup_centered()
+
+func _open_object_pattern_dialog():
+	if _object_file_dialog == null or not is_instance_valid(_object_file_dialog):
+		_object_file_dialog = _make_pattern_file_dialog(
+			"_on_st_object_pattern_file_selected",
+			"Object pattern image (alpha > 0 blocks light)")
+	# Same capture as the portal's, for the same reason.
+	_pattern_file_object = _current_object
+	_object_file_dialog.popup_centered()
+
+# The object twin of _on_st_portal_pattern_file_selected, line for line.
+func _on_st_object_pattern_file_selected(path):
+	var obj = _pattern_file_object
+	_pattern_file_object = null
+	if obj == null or not is_instance_valid(obj):
+		outputlog("pattern image picked but the object is gone — ignored", 0)
+		return
+	# Re-picking a path must beat the renderer's texture cache (the file may
+	# have been edited on disk since the last load).
+	if shadow_renderer != null:
+		shadow_renderer.invalidate_custom_pattern(str(path))
+	set_object_value(obj, "pattern_file", str(path))
+	if int(get_object_cfg(obj).get("pattern", 0)) != PATTERN_CUSTOM:
+		set_object_value(obj, "pattern", PATTERN_CUSTOM)
+	if obj == _current_object:
+		_syncing = true
+		st_ui["object_pattern"].selected = PATTERN_CUSTOM
+		_syncing = false
+		_update_object_custom_row(get_object_cfg(obj))
 
 func _on_st_portal_pattern_file_selected(path):
 	var portal = _pattern_file_portal
@@ -1290,6 +1653,73 @@ func _on_st_portal_project_toggled(pressed):
 	# prop that update_uniforms alone would never build.
 	if core != null:
 		core.request_rebuild(false, true)
+
+func _on_st_object_project_toggled(pressed):
+	if _syncing or _current_object == null:
+		return
+	var nid = core.get_node_id(_current_object)
+	if nid == null:
+		outputlog("Cannot store object state: object has no node_id", 0)
+		return
+	var store = _get_object_store()
+	if not (store.has(nid) and store[nid] is Dictionary):
+		store[nid] = {}
+	store[nid]["project"] = pressed
+	outputlog("object %s: cast pattern shadow = %s" % [nid, str(pressed)], 0)
+	# FIELD rebuild, not uniforms-only: turning this on promotes the object to a
+	# projector-only caster, which creates a layer group and a ghost prop that
+	# update_uniforms alone would never build.
+	if core != null:
+		core.request_rebuild(false, true)
+
+func _on_st_object_cast_mode_selected(index):
+	if _syncing or _current_object == null:
+		return
+	set_object_value(_current_object, "cast_mode", int(index))
+
+func _on_st_object_pattern_selected(index):
+	if _syncing or _current_object == null:
+		return
+	set_object_value(_current_object, "pattern", int(index))
+	_update_object_custom_row(get_object_cfg(_current_object))
+	# First time Custom is picked there is nothing to show yet — go straight to
+	# the picker instead of silently casting nothing.
+	if int(index) == PATTERN_CUSTOM and str(get_object_cfg(_current_object).get("pattern_file", "")) == "":
+		_open_object_pattern_dialog()
+
+func _on_st_object_pattern_file_pressed():
+	if _current_object == null:
+		return
+	_open_object_pattern_dialog()
+
+func _on_st_object_tile_changed(value):
+	if _syncing or _current_object == null:
+		return
+	set_object_value(_current_object, "tile", float(value))
+
+func _on_st_object_top_changed(value):
+	if _syncing or _current_object == null:
+		return
+	set_object_value(_current_object, "top", float(value))
+
+func _on_st_object_bottom_changed(value):
+	if _syncing or _current_object == null:
+		return
+	set_object_value(_current_object, "bottom", float(value))
+
+func _on_st_object_width_changed(value):
+	if _syncing or _current_object == null:
+		return
+	set_object_value(_current_object, "width_adjust", float(value))
+
+func _update_object_custom_row(ocfg: Dictionary):
+	if not st_ui.has("object_custom_row"):
+		return
+	var is_custom = int(ocfg.get("pattern", 0)) == PATTERN_CUSTOM
+	st_ui["object_custom_row"].visible = is_custom
+	var pfile = str(ocfg.get("pattern_file", ""))
+	st_ui["object_custom_label"].text = pfile.get_file() if pfile != "" else "(no image)"
+	st_ui["object_custom_label"].hint_tooltip = pfile
 
 func _on_st_inset_changed(value):
 	if _syncing or _current_path == null:

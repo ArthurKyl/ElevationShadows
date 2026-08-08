@@ -1093,19 +1093,20 @@ func _build_groups():
 	_groups = []
 	_projector_only = {}
 	var casters = path_tagging.get_caster_nodes()
-	# Walls that host a projecting portal but cast nothing join their layer's
-	# group so a ghost prop exists to draw the projection onto. Without this a
-	# map with no enabled casters returns zero groups and there is nowhere to
-	# draw at all. They are recorded so the fill loop skips them.
-	var projectors = path_tagging.get_projector_walls()
-	for wall in projectors:
-		var wnid = core.get_node_id(wall)
-		if wnid == null:
+	# Nodes that host a projector but cast nothing join their layer's group so a
+	# ghost prop exists to draw the projection onto. Without this a map with no
+	# enabled casters returns zero groups and there is nowhere to draw at all.
+	# They are recorded so the fill loop skips them. A projecting PORTAL puts its
+	# host WALL here; a projecting OBJECT puts ITSELF here.
+	var projectors = path_tagging.get_projector_nodes()
+	for pnode in projectors:
+		var pnid = core.get_node_id(pnode)
+		if pnid == null:
 			continue
-		_projector_only[wnid] = true
-		casters.append(wall)
+		_projector_only[pnid] = true
+		casters.append(pnode)
 	if projectors.size() > 0:
-		outputlog("%d projector-only wall(s) joined (host a projecting portal, cast nothing)" % projectors.size(), 0)
+		outputlog("%d projector-only node(s) joined (host a projecting portal or object, cast nothing)" % projectors.size(), 0)
 	if casters.size() == 0:
 		return
 

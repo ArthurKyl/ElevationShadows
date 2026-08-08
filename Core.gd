@@ -35,15 +35,21 @@ const ORDER_KEY = "ElevationShadowsOrder"
 # has no reachable UI, so the mod exposes its own toggle; the DD flag is only
 # the fallback default.
 const PORTAL_KEY = "ElevationShadowsPortals"
+# Per-object pattern projection, keyed by node_id. A SEPARATE key from
+# PORTAL_KEY even though the fields overlap: repointing PORTAL_KEY would orphan
+# every saved map's portal settings.
+const OBJECT_KEY = "ElevationShadowsObjects"
 
 var SunSettingsScript
 var PathTaggingScript
 var HeightFieldScript
 var ShadowRendererScript
+var SilhouetteScript
 var sun_settings = null
 var path_tagging = null
 var height_field = null
 var shadow_renderer = null
+var silhouette = null
 
 #########################################################################################################
 ## LOGGING
@@ -188,6 +194,24 @@ func start() -> void:
 	shadow_renderer.path_tagging = path_tagging
 	shadow_renderer.height_field = height_field
 	shadow_renderer.initialise()
+
+	SilhouetteScript = ResourceLoader.load(Global.Root + "Silhouette.gd", "GDScript", true)
+	# NOT fatal, unlike the loads above. Silhouette only measures the emitter for
+	# object-cast patterns; ShadowRenderer._rebuild_projection_quads already
+	# null-guards the member. Returning here used to take per-layer shadows,
+	# one-sided walls, beams, blockers and export down with it, so a partial
+	# install lost everything rather than the one feature it was missing. Leave
+	# `silhouette` null and carry on: shadow_renderer.silhouette stays null too.
+	if SilhouetteScript == null:
+		outputlog("WARNING: Silhouette.gd failed to load — objects cannot cast pattern shadows " +
+			"(the per-object \"Cast pattern shadow\" switch will draw nothing). " +
+			"Every other feature is unaffected.", 0)
+	else:
+		silhouette = SilhouetteScript.new()
+		silhouette.global = Global
+		silhouette.core = self
+		silhouette.initialise()
+		shadow_renderer.silhouette = silhouette
 
 	# Cross-wire so config changes can trigger a rebuild.
 	sun_settings.height_field = height_field
