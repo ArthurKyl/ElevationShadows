@@ -1282,7 +1282,8 @@ func rebuild():
 	var clamp_parts = PoolStringArray()
 	for gi in range(_slot_art_max.size()):
 		clamp_parts.append("%.2f" % _slot_art_max[gi])
-	outputlog("art footprint [artfoot v3]: %d of %d contour path(s) raised onto their own art (alpha >= %.2f) | per-slot clamp tiers: %s" % [
+	outputlog("art footprint [artfoot v3] %s: %d of %d contour path(s) raised onto their own art (alpha >= %.2f) | per-slot clamp tiers: %s" % [
+		"ON" if bool(sun_settings.get_sun().get("bake_art_elevation", true)) else "OFF (Art raises elevation unticked)",
 		art_raised, art_candidates, ART_ALPHA_THRESHOLD, clamp_parts.join(" / ")], 0)
 
 	_build_smooth_passes(vp_size)
@@ -1854,6 +1855,8 @@ func _copy_art_line(src, copy_antialiased: bool = true) -> Line2D:
 # takes its half-width from the Line2D's width), so the asymmetry cannot arise
 # for them and a second footprint would only fight the blur-safe widening.
 func _has_art_footprint(path) -> bool:
+	if not bool(sun_settings.get_sun().get("bake_art_elevation", true)):
+		return false
 	if path_tagging.is_wall_node(path):
 		return false
 	if int(path_tagging.get_config(path).get("side", 0)) == 2:
@@ -2061,7 +2064,14 @@ func _refresh_debug_sprite():
 		return
 
 	for ci in range(_chains.size()):
-		var tex = get_raw_texture(ci)
+		# THE FIELD THE MARCH READS — blurred, and with the art footprint already
+		# combined in. It used to show the raw fill raster, which hid two whole
+		# classes of defect from view: anything the footprint contributes (a
+		# separate target, combined downstream) and anything the blur does to a
+		# thin feature. A debug view that does not show what the consumer
+		# consumes is worse than none — it was showing a clean field under an
+		# artefact and sending the diagnosis to the wrong half of the pipeline.
+		var tex = get_field_texture(ci)
 		if tex == null:
 			continue
 		var sprite = Sprite.new()
@@ -2092,11 +2102,7 @@ func _refresh_debug_sprite():
 			str(tex_size), str(sprite.position), str(sprite.scale),
 			str(Vector2(tex_size.x * sprite.scale.x, tex_size.y * sprite.scale.y)),
 			str(_raster_rect.size), int(HEIGHT_DIVISOR), HEIGHT_DIVISOR / 4.0], 0)
-	# The overlay shows the FILL raster only. The art footprint is a separate
-	# target combined at blur time (max, not add), so its absence here is not a
-	# sign that it failed — read the `art footprint [artfoot v3]` line and the
-	# mask probe's BARE-ground count for that.
-	outputlog("debug overlay shows the fill raster only; art footprint is combined downstream", 1)
+	outputlog("debug overlay shows the SMOOTHED field the march reads (fills + art footprint, blurred)", 1)
 
 func _remove_debug_sprite():
 	for sprite in _debug_sprites:

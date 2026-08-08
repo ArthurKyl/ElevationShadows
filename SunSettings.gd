@@ -75,6 +75,13 @@ const SUN_DEFAULTS = {
 	# occluders appear on the blur ramps.
 	"level_blend": 3.0,
 	"debug_height_field": false,
+	# Bake each contour path's own artwork into the elevation field, so the
+	# elevation step ends at the texture's opaque edge instead of on the drawn
+	# centreline. On by default — it is what stops a higher layer's shadow
+	# drawing a hard line across a lower cliff's art. Exposed as a switch
+	# because it is the one change that can be A/B'd against the old behaviour
+	# on screen without swapping builds.
+	"bake_art_elevation": true,
 }
 
 # Which settings invalidate what.
@@ -88,7 +95,7 @@ const SUN_DEFAULTS = {
 # (debug_height_field only shows/hides the overlay; follow_roof_sun only affects
 # whether azimuth tracks DD's slider).
 const MESH_KEYS = ["azimuth", "altitude", "opacity", "softness", "shadow_tint", "tier_px"]
-const FIELD_KEYS = ["tier_px", "level_blend"]
+const FIELD_KEYS = ["tier_px", "level_blend", "bake_art_elevation"]
 
 # Side of the Direction compass dial, px. The dial row is the panel's one row
 # taller than a slider, so this is the panel's height budget knob — keep it
@@ -260,6 +267,14 @@ func _build_ui(parent):
 
 	var sep2 = HSeparator.new()
 	parent.add_child(sep2)
+
+	var bake = CheckButton.new()
+	bake.text = "Art raises elevation"
+	bake.hint_tooltip = "Bake each cliff path's own artwork into the elevation field,\nwhere the texture is fully opaque.\nOff = the elevation step sits on the drawn line, and a higher\nlayer's shadow can cross a lower cliff's art as a hard edge."
+	bake.pressed = sun.get("bake_art_elevation", true)
+	bake.connect("toggled", self, "_on_bake_art_toggled")
+	parent.add_child(bake)
+	ui["bake_art_elevation"] = bake
 
 	var dbg = CheckButton.new()
 	dbg.text = "Show elevation field"
@@ -518,6 +533,9 @@ func _set_mode_buttons(active: int):
 func get_mode() -> int:
 	return int(sun.get("mode", 2))
 
+func _on_bake_art_toggled(pressed):
+	_set_value("bake_art_elevation", pressed)
+
 func _on_debug_height_toggled(pressed):
 	_set_value("debug_height_field", pressed)
 	if height_field != null:
@@ -562,7 +580,7 @@ func _sync_ui_from_state():
 			continue
 		_sync_row_widget(key, sun[key])
 		ui[key]["spin"].value = sun[key]
-	for flag_key in ["follow_roof_sun", "debug_height_field"]:
+	for flag_key in ["follow_roof_sun", "debug_height_field", "bake_art_elevation"]:
 		if ui.has(flag_key) and ui[flag_key] is CheckButton:
 			ui[flag_key].pressed = sun.get(flag_key, true)
 	# The tint picker is neither a slider dict nor a CheckButton — its own branch.
