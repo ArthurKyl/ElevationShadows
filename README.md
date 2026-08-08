@@ -179,8 +179,15 @@ layer ordering works out — and re-baked only when something changes. Per-path,
 per-portal and per-object config lives in the map file via Dungeondraft's mod
 data, so it all survives save and reload.
 
-## Known issues
+## Known bugs
 
-- **Follow DD roof sun** currently syncs the horizontal axis correctly but
-  inverts the vertical one, so roof shading and elevation shadows disagree on
-  north/south. Set the mod's own Direction until this is fixed.
+- **Wall and portal shadows ignore layering.** Anything cast by a wall — its
+  shadow and its projected portal patterns — draws on top of every user layer,
+  so a walkway on layer 400 crossing over a gate still gets the gate's shadow
+  painted across it. Dungeondraft keeps walls in their own container above
+  layers 100–400, and the shadow inherits that position, so no per-wall or
+  per-portal setting can push it under. Paths are unaffected; only wall-based
+  casters have this.
+- **Follow DD roof sun inverts one axis.** East/west follows correctly,
+  north/south is flipped, so roof shading and elevation shadows disagree. Set
+  the mod's own Direction until this is fixed.
