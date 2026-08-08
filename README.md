@@ -202,6 +202,21 @@ data, so it all survives save and reload.
   north/south is flipped, so roof shading and elevation shadows disagree. Set
   the mod's own Direction until this is fixed.
 
+## Found a bug? Want something?
+
+[Open an issue](https://github.com/ArthurKyl/ElevationShadows/issues/new/choose).
+For anything visual, a screenshot plus a shot with **Show elevation field**
+turned on is usually all it takes to work out what happened.
+
+Two things worth knowing before you report:
+
+- **Check Known bugs below first** — a few things are already known, and two of
+  them have workarounds.
+- **Other shadow mods stack with this one.** Soft Shadows, Dropshadower and
+  friends draw their own shadows on top of these, which reads as everything
+  being too dark or shadows appearing twice. If something looks doubled, try
+  disabling them before reporting.
+
 ## License
 
 Copyright © 2026 ArthurKyl.

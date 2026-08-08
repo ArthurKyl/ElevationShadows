@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Known bugs
+    url: https://github.com/ArthurKyl/ElevationShadows#known-bugs
+    about: Check here first — a few things are already known and have workarounds.
+  - name: Questions and ideas
+    url: https://github.com/ArthurKyl/ElevationShadows/discussions
+    about: Not sure it's a bug, or just want to show a map you made with it? Start a discussion.

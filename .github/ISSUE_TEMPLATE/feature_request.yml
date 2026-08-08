@@ -1,0 +1,38 @@
+name: Feature request
+description: Something you want to draw that the mod can't do yet
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most useful requests describe **the map you're trying to make**, not the setting you think should exist. Several of this mod's features started as someone describing a scene.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to make?
+      description: Describe the scene or effect. A reference image is ideal.
+      placeholder: |
+        A ruined tower where light comes through the collapsed roof and lands
+        in a patch on the floor, moving as I change the sun.
+    validations:
+      required: true
+
+  - type: textarea
+    id: blocked
+    attributes:
+      label: What stops you today?
+      description: What did you try, and where did it fall short?
+      placeholder: |
+        I can project a pattern through a wall portal, but there's no way to
+        cast light down through something above the floor.
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Alternatives you considered, other tools that do this well, or a sketch.
+    validations:
+      required: false

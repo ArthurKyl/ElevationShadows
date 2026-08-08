@@ -1,0 +1,115 @@
+name: Bug report
+description: Something renders wrong, crashes, or doesn't do what the README says
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. This mod is visual, so **a screenshot is worth more than a paragraph** — please include one if you possibly can.
+
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: What did you see, and what did you expect instead?
+      placeholder: |
+        The shadow from my cliff falls on the wrong side of the path.
+        I expected it to fall away from the sun.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce it
+      description: The shortest sequence that shows the problem. A small test map beats a big real one.
+      placeholder: |
+        1. New map, 20x20
+        2. Draw a path, tag it Elevation Shadow, Side A, 10 ft
+        3. Set Sun height to 20
+        4. The shadow appears on the uphill side
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot
+      description: |
+        Drag an image in here.
+
+        If it's about shadow shape, length or elevation, please also turn on **Show elevation field** in the Elevation Shadows tool and add a second screenshot. That overlay shows the heights the mod actually computed, and it usually answers the question on its own.
+      placeholder: Paste or drag images here.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: map-file
+    attributes:
+      label: Can you share the map file if asked?
+      description: Some bugs only show up in the map they happened in. Nothing is required — this just tells me whether it's worth asking.
+      options:
+        - "Yes"
+        - "No"
+        - "Maybe — depends what's in it"
+    validations:
+      required: true
+
+  - type: input
+    id: discord
+    attributes:
+      label: Discord handle (optional)
+      description: |
+        Handy if I need to ask for the map file, since you probably don't want to attach it to a public issue. Leave blank if you'd rather keep everything here.
+
+        Note this will be publicly visible on the issue.
+      placeholder: "yourname"
+    validations:
+      required: false
+
+  - type: input
+    id: mod-version
+    attributes:
+      label: Elevation Shadows version
+      description: Shown in Dungeondraft's Mods menu.
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: dd-version
+    attributes:
+      label: Dungeondraft version
+      placeholder: "1.2.0.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: other-mods
+    attributes:
+      label: Other mods you have enabled
+      description: |
+        This matters more than usual: **other shadow mods draw their own shadows on top of this one's**, which reads as everything being too dark, or shadows appearing twice. If you use Soft Shadows, Dropshadower or anything similar, please say so.
+      placeholder: |
+        Soft Shadows, Essential Utils
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the **Known bugs** section of the README and this isn't one of them
+          required: true
