@@ -1017,6 +1017,44 @@ func _poly_area(poly) -> float:
 		total += a.x * b.y - b.x * a.y
 	return total * 0.5
 
+# Tallest first. The within-group max subtracts each already-placed region out
+# of the ones below it, so the ORDER is the whole mechanism.
+func _by_height_desc(a, b) -> bool:
+	return float(a["height"]) > float(b["height"])
+
+# `solids` minus one already-placed region, with a bounding-box reject in front
+# of Clipper — most strip pairs on a map do not touch at all, and this runs
+# O(strips^2) times per slot.
+#
+# THE CLIPPER TRAP (HANDOFF §4): "A minus B" returns the hole as a CLOCKWISE
+# polygon in the same array. Fed onward raw it re-solidifies and double-fills —
+# the exact bug that produced 109%-of-map regions once before. Clockwise results
+# are split out and routed through _subtract_holes, which cuts each solid in two
+# through the hole so ear clipping can triangulate it.
+func _poly_minus_bboxed(solids: Array, cut: Dictionary) -> Array:
+	var packed_cut = _to_packed(cut["poly"])
+	if packed_cut.size() < 3 or solids.size() == 0:
+		return solids
+	var cut_bbox = cut["bbox"]
+	var out = []
+	var holes = []
+	var touched = false
+	for piece in solids:
+		if not cut_bbox.intersects(_poly_bbox(piece)):
+			out.append(piece)
+			continue
+		touched = true
+		for res in Geometry.clip_polygons_2d(_to_packed(piece), packed_cut):
+			if res.size() < 3:
+				continue
+			if Geometry.is_polygon_clockwise(res):
+				holes.append(res)
+			else:
+				out.append(res)
+	if not touched:
+		return solids
+	return _subtract_holes(out, holes)
+
 # The height goes into ONE colour channel — the one belonging to this caster's
 # layer group — not into all three. That channel is the whole per-layer
 # attribution mechanism; see the SLOTS notes at the top of this file.
@@ -1026,6 +1064,25 @@ func _channel_color(channel: int, value: float) -> Color:
 	if channel == 1:
 		return Color(0.0, value, 0.0, 1.0)
 	return Color(0.0, 0.0, value, 1.0)
+
+# One fill polygon into its slot's channel. Additive: casters on DIFFERENT
+# layers write different channels and still stack into the total (= the sum of
+# the channels) while staying individually attributable. Strip regions within a
+# channel are made disjoint before they get here, so their sum IS the maximum.
+func _draw_fill(chain: Dictionary, slot: int, channel: int, path, height: float, poly) -> bool:
+	outputlog("  slot %d path %s h=%.2f poly %d pts bbox=%s area=%.1f%% of map" % [
+		slot, str(core.get_node_id(path)), height, poly.size(), str(_poly_bbox(poly)),
+		100.0 * abs(_poly_area(poly)) / _map_area()], 0)
+	var mesh = _make_polygon_mesh(poly, _channel_color(channel, height / HEIGHT_DIVISOR))
+	if mesh == null:
+		return false
+	var mi = MeshInstance2D.new()
+	mi.mesh = mesh
+	var mat = CanvasItemMaterial.new()
+	mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
+	mi.material = mat
+	chain["root"].add_child(mi)
+	return true
 
 func _make_polygon_mesh(poly, c: Color):
 	var packed = _to_packed(poly)
@@ -1318,30 +1375,9 @@ func rebuild():
 					parts.append(cleaned)
 
 			for poly in parts:
-				# Report what each fill actually covers. "covers X% of map" is the
-				# fast tell for a wrong-side fill: a contour region should be a
-				# modest fraction, not ~100%.
-				var bbox = _poly_bbox(poly)
-				var map_area = max(1.0, _map_rect.size.x * _map_rect.size.y)
-				outputlog("  slot %d path %s h=%.2f poly %d pts bbox=%s area=%.1f%% of map" % [
-					gi, str(core.get_node_id(path)), height, poly.size(), str(bbox),
-					100.0 * abs(_poly_area(poly)) / map_area], 0)
-
-				var mesh = _make_polygon_mesh(poly, _channel_color(channel, height / HEIGHT_DIVISOR))
-				if mesh == null:
-					continue
-				var mi = MeshInstance2D.new()
-				mi.mesh = mesh
-				# Additive so nested contours accumulate into stacked tiers. Because
-				# each group writes only its own channel, contours on DIFFERENT layers
-				# still stack into the total (= the sum of the channels) while staying
-				# individually attributable.
-				var mat = CanvasItemMaterial.new()
-				mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
-				mi.material = mat
-				chain["root"].add_child(mi)
-				drawn += 1
-				group_drawn += 1
+				if _draw_fill(chain, gi, channel, path, height, poly):
+					drawn += 1
+					group_drawn += 1
 
 			# ART FOOTPRINT — only now, after the fill actually rasterised. A
 			# contour whose closure failed (`polys.size() == 0` above) must not
