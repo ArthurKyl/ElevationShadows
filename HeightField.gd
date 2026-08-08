@@ -1840,6 +1840,10 @@ func _build_art_masks(vp_size: Vector2):
 
 		var chan_color = [Vector3(1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)][channel]
 		for path in by_layer[layer_key]:
+			# Projector-only walls raise no elevation, so they cast no shadow
+			# of their own to hide under their art — skip them in the mask too.
+			if is_projector_only(path):
+				continue
 			var inset = float(path_tagging.get_config(path).get("mask_inset", 5.0))
 			# A path IS a Line2D; a wall's art lives in its child Line2D
 			# segments (already portal-gapped). Copy whichever carries the art.
