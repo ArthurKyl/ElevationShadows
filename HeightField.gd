@@ -1004,6 +1004,23 @@ func _poly_bbox(poly) -> Rect2:
 		r = r.expand(p)
 	return r
 
+# Union bbox over a whole parts list, for a single conservative reject test
+# against many already-placed casters at once (see the WALL OVERLAP MAX loop).
+# Callers must pass entry["parts"] (the ORIGINALS) and compute this ONCE per
+# entry, before trimming starts — a box that shrank as pieces got cut down
+# could reject a cut that still legitimately overlaps the untrimmed remainder.
+func _parts_bbox(parts: Array) -> Rect2:
+	var r = Rect2()
+	var have_r = false
+	for poly in parts:
+		var pb = _poly_bbox(poly)
+		if not have_r:
+			r = pb
+			have_r = true
+		else:
+			r = r.merge(pb)
+	return r
+
 # Shoelace area. Sign indicates winding; callers take abs().
 func _poly_area(poly) -> float:
 	var packed = _to_packed(poly)
@@ -1017,6 +1034,44 @@ func _poly_area(poly) -> float:
 		total += a.x * b.y - b.x * a.y
 	return total * 0.5
 
+# Tallest first. The within-group max subtracts each already-placed region out
+# of the ones below it, so the ORDER is the whole mechanism.
+func _by_height_desc(a, b) -> bool:
+	return float(a["height"]) > float(b["height"])
+
+# `solids` minus one already-placed region, with a bounding-box reject in front
+# of Clipper — most strip pairs on a map do not touch at all, and this runs
+# O(strips^2) times per slot.
+#
+# THE CLIPPER TRAP (HANDOFF §4): "A minus B" returns the hole as a CLOCKWISE
+# polygon in the same array. Fed onward raw it re-solidifies and double-fills —
+# the exact bug that produced 109%-of-map regions once before. Clockwise results
+# are split out and routed through _subtract_holes, which cuts each solid in two
+# through the hole so ear clipping can triangulate it.
+func _poly_minus_bboxed(solids: Array, cut: Dictionary) -> Array:
+	var packed_cut = _to_packed(cut["poly"])
+	if packed_cut.size() < 3 or solids.size() == 0:
+		return solids
+	var cut_bbox = cut["bbox"]
+	var out = []
+	var holes = []
+	var touched = false
+	for piece in solids:
+		if not cut_bbox.intersects(_poly_bbox(piece)):
+			out.append(piece)
+			continue
+		touched = true
+		for res in Geometry.clip_polygons_2d(_to_packed(piece), packed_cut):
+			if res.size() < 3:
+				continue
+			if Geometry.is_polygon_clockwise(res):
+				holes.append(res)
+			else:
+				out.append(res)
+	if not touched:
+		return solids
+	return _subtract_holes(out, holes)
+
 # The height goes into ONE colour channel — the one belonging to this caster's
 # layer group — not into all three. That channel is the whole per-layer
 # attribution mechanism; see the SLOTS notes at the top of this file.
@@ -1026,6 +1081,25 @@ func _channel_color(channel: int, value: float) -> Color:
 	if channel == 1:
 		return Color(0.0, value, 0.0, 1.0)
 	return Color(0.0, 0.0, value, 1.0)
+
+# One fill polygon into its slot's channel. Additive: casters on DIFFERENT
+# layers write different channels and still stack into the total (= the sum of
+# the channels) while staying individually attributable. Strip regions within a
+# channel are made disjoint before they get here, so their sum IS the maximum.
+func _draw_fill(chain: Dictionary, slot: int, channel: int, path, height: float, poly) -> bool:
+	outputlog("  slot %d path %s h=%.2f poly %d pts bbox=%s area=%.1f%% of map" % [
+		slot, str(core.get_node_id(path)), height, poly.size(), str(_poly_bbox(poly)),
+		100.0 * abs(_poly_area(poly)) / _map_area()], 0)
+	var mesh = _make_polygon_mesh(poly, _channel_color(channel, height / HEIGHT_DIVISOR))
+	if mesh == null:
+		return false
+	var mi = MeshInstance2D.new()
+	mi.mesh = mesh
+	var mat = CanvasItemMaterial.new()
+	mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
+	mi.material = mat
+	chain["root"].add_child(mi)
+	return true
 
 func _make_polygon_mesh(poly, c: Color):
 	var packed = _to_packed(poly)
@@ -1271,6 +1345,11 @@ func rebuild():
 		var chain = _chains[int(gi / SLOTS_PER_CHAIN)]
 		var channel = gi % SLOTS_PER_CHAIN
 		var group_drawn = 0
+		# Strip casters are collected rather than drawn: they combine with
+		# max, which is built by cutting (see the loop after this one).
+		var pending = []
+		var slot_before = 0.0
+		var slot_after = 0.0
 
 		for path in group["casters"]:
 			# Projector-only walls are here for the ghost prop, not the field.
@@ -1317,40 +1396,115 @@ func rebuild():
 				for cleaned in _clean_polygon(poly):
 					parts.append(cleaned)
 
-			for poly in parts:
-				# Report what each fill actually covers. "covers X% of map" is the
-				# fast tell for a wrong-side fill: a contour region should be a
-				# modest fraction, not ~100%.
-				var bbox = _poly_bbox(poly)
-				var map_area = max(1.0, _map_rect.size.x * _map_rect.size.y)
-				outputlog("  slot %d path %s h=%.2f poly %d pts bbox=%s area=%.1f%% of map" % [
-					gi, str(core.get_node_id(path)), height, poly.size(), str(bbox),
-					100.0 * abs(_poly_area(poly)) / map_area], 0)
+			if is_wall or side == 2:
+				# STRIP CASTERS — a wall is a thing standing on ground, and
+				# two walls crossing is one corner, not a tower. Collected
+				# here and drawn by the max loop below.
+				pending.append({"path": path, "height": height, "parts": parts})
+			else:
+				# CONTOUR FILLS — topographic lines. Adding them IS the
+				# feature: nested contours ascend into a summit. Untouched.
+				for poly in parts:
+					if _draw_fill(chain, gi, channel, path, height, poly):
+						drawn += 1
+						group_drawn += 1
 
-				var mesh = _make_polygon_mesh(poly, _channel_color(channel, height / HEIGHT_DIVISOR))
-				if mesh == null:
-					continue
-				var mi = MeshInstance2D.new()
-				mi.mesh = mesh
-				# Additive so nested contours accumulate into stacked tiers. Because
-				# each group writes only its own channel, contours on DIFFERENT layers
-				# still stack into the total (= the sum of the channels) while staying
-				# individually attributable.
-				var mat = CanvasItemMaterial.new()
-				mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
-				mi.material = mat
-				chain["root"].add_child(mi)
-				drawn += 1
-				group_drawn += 1
-
-			# ART FOOTPRINT — only now, after the fill actually rasterised. A
-			# contour whose closure failed (`polys.size() == 0` above) must not
-			# get one either: art elevation with no fill under it is a floating
-			# ridge, and its far edge would cast a shadow back across the hill.
+			# ART FOOTPRINT — for a CONTOUR, only now, after its fill actually
+			# rasterised above. For a STRIP CASTER (wall / side == 2) the fill is
+			# deferred to the max loop below, so at this point it has NOT drawn
+			# yet — but that's safe: _has_art_footprint is contour-only by
+			# construction (it returns false for wall nodes and for side == 2
+			# paths), so no strip caster ever reaches this branch, and the
+			# deferred fill below cannot affect an art footprint that never gets
+			# requested. A contour whose closure failed (`polys.size() == 0`
+			# above) must not get one either: art elevation with no fill under it
+			# is a floating ridge, and its far edge would cast a shadow back
+			# across the hill.
 			if _has_art_footprint(path):
 				art_candidates += 1
 				if _draw_art_footprint(chain, gi, channel, path, height, vp_size) > 0:
 					art_raised += 1
+
+		# ---------------------------------------------------------------
+		# WALL OVERLAP MAX
+		# ---------------------------------------------------------------
+		# Elevation where two walls cross is the taller wall, not the sum. A
+		# corner of two 5 ft walls is a 5 ft corner; today it is a 10 ft tower
+		# throwing a shadow twice as long as the walls it belongs to.
+		#
+		# ACROSS layers the sum stays right and intended (separate channels), and
+		# a strip over a CONTOUR still sums, because a wall on raised ground is
+		# raised: 10 ft of wall on a 20 ft cliff really is 30 ft.
+		#
+		# There is no MAX blend in Godot 3 to do this with, so the max is built
+		# in Clipper: draw the TALLEST first and subtract everything already
+		# placed out of each shorter one, which makes the additive raster sum to
+		# the maximum by construction. Subtraction uses the ORIGINAL regions, not
+		# the trimmed remainders, or a tall region's ground would be re-claimed
+		# by a short one that merely overlapped the same area later.
+		pending.sort_custom(self, "_by_height_desc")
+		var placed = []          # [{poly, bbox}] — originals, tallest first
+		for entry in pending:
+			var epath = entry["path"]
+			var eheight = float(entry["height"])
+			var kept = entry["parts"]
+			# One conservative box for the WHOLE entry, computed from the
+			# originals before any trimming — see _parts_bbox. Cheap reject in
+			# front of the O(strips) already-placed loop below, which is itself
+			# in front of Clipper inside _poly_minus_bboxed.
+			var entry_bbox = _parts_bbox(entry["parts"])
+			var was_cut = false
+			for cut in placed:
+				if kept.size() == 0:
+					break
+				if not cut["bbox"].intersects(entry_bbox):
+					continue
+				was_cut = true
+				kept = _poly_minus_bboxed(kept, cut)
+			# Ear clipping SUCCEEDS on a self-touching polygon, emitting
+			# overlapping triangles that blend_add then doubles — recreating the
+			# very stacking this loop removes. Clean every subtracted piece —
+			# but only if something actually cut it: an untouched entry's parts
+			# were already cleaned above (:1379), and re-cleaning them here can
+			# only cost time, while a spurious kept.size() != entry["parts"].size()
+			# mismatch below would print a false "wall overlap max" line for a
+			# wall nothing touched.
+			var simple = kept
+			if was_cut:
+				simple = []
+				for poly in kept:
+					for cleaned in _clean_polygon(poly):
+						simple.append(cleaned)
+			kept = simple
+			var before_area = 0.0
+			for poly in entry["parts"]:
+				before_area += abs(_poly_area(poly))
+			var after_area = 0.0
+			for poly in kept:
+				after_area += abs(_poly_area(poly))
+			slot_before += before_area
+			slot_after += after_area
+			if kept.size() != entry["parts"].size() or after_area < before_area - 1.0:
+				outputlog("  slot %d path %s h=%.2f: %d part(s) %.1f%% of map -> %d piece(s) %.1f%% after wall overlap max" % [
+					gi, str(core.get_node_id(epath)), eheight, entry["parts"].size(),
+					100.0 * before_area / _map_area(), kept.size(),
+					100.0 * after_area / _map_area()], 0)
+			for poly in kept:
+				if _draw_fill(chain, gi, channel, epath, eheight, poly):
+					drawn += 1
+					group_drawn += 1
+			for poly in entry["parts"]:
+				placed.append({"poly": poly, "bbox": _poly_bbox(poly)})
+
+		# THE ACCEPT TEST, arithmetic rather than aesthetic: a slot's strip fills
+		# must stop summing to more ground than they actually cover. Scoped to
+		# strips — contours legitimately sum, so a whole-slot version of this
+		# would fire on every normal map.
+		if pending.size() > 0:
+			outputlog("slot %d wall overlap max: %d strip fill(s), %.1f%% -> %.1f%% of map (%.1fpp of overlap removed)" % [
+				gi, pending.size(), 100.0 * slot_before / _map_area(),
+				100.0 * slot_after / _map_area(),
+				100.0 * (slot_before - slot_after) / _map_area()], 0)
 
 		outputlog("slot %d: layer %d -> chain %d channel %s, %d caster(s), %d polygon(s)" % [
 			gi, int(group["layer"]), int(gi / SLOTS_PER_CHAIN), ["R", "G", "B"][channel],
@@ -1366,6 +1520,8 @@ func rebuild():
 	outputlog("art footprint [artfoot v4] %s: %d of %d contour path(s) raised onto their own art (alpha >= %.2f) | per-slot clamp tiers: %s" % [
 		"ON" if bool(sun_settings.get_sun().get("bake_art_elevation", true)) else "OFF (Art raises elevation unticked)",
 		art_raised, art_candidates, ART_ALPHA_THRESHOLD, clamp_parts.join(" / ")], 0)
+
+	outputlog("wall overlap: max [walloverlap v1]", 0)
 
 	_build_smooth_passes(vp_size)
 	_build_art_masks(vp_size)
