@@ -1138,11 +1138,21 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 	var d_cap = raster_rect.size.length() if raster_rect != null else 100000.0
 	var quads = 0
 	var clamped = 0
+	# Diagnostic counters for the summary below. "I ticked Project pattern and
+	# nothing appeared" is the failure the owner will actually hit, and the log
+	# is this project's only test harness, so every skip path is counted and
+	# reported rather than passing in silence.
+	var roots = 0
+	var portals = 0
+	var no_pattern = 0
+	var collapsed = 0
+	var degenerate = 0
 
 	for g in _groups:
 		var root = g.get("proj_root")
 		if root == null or not is_instance_valid(root):
 			continue
+		roots += 1
 		for child in root.get_children():
 			child.queue_free()
 		for caster in height_field.get_group_casters(g["slot"]):
@@ -1153,11 +1163,26 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 			for portal in height_field.get_all_wall_portals(caster):
 				if not path_tagging.is_portal_projecting(portal):
 					continue
+				portals += 1
 				var a = portal.get("Begin")
 				var b = portal.get("End")
 				if not (a is Vector2 and b is Vector2) or (b - a).length() < 1.0:
+					degenerate += 1
 					continue
 				var pcfg = path_tagging.get_portal_cfg(portal)
+				# RESOLVED FIRST, ahead of the wall-height clamp: a plain opening
+				# has nothing to cast, and a portal that will draw nothing must
+				# not be clamped, counted or warned about. At stock settings a
+				# default wall is 1 tier = 5 ft while PORTAL_DEFAULTS.top is
+				# 8 ft, so every projecting portal on a default-height casting
+				# wall tripped the clamp's level-0 "raise the wall's Height" line
+				# — repeated on every settled sun/Strength change, telling the
+				# user to fix something that would draw nothing either way.
+				var resolved = _portal_pattern_texture(portal, pcfg)
+				var pattern_tex = resolved[0]
+				if pattern_tex == null:
+					no_pattern += 1
+					continue
 				var want_top = float(pcfg.get("top", 8.0))
 				# The clamp to the wall's own height applies ONLY to a wall that
 				# actually casts. There it keeps the projection consistent with
@@ -1179,12 +1204,7 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 							str(core.get_node_id(portal)), want_top, top_ft,
 							str(core.get_node_id(caster))], 0)
 				if top_ft <= bottom_ft + 0.01:
-					continue
-				var resolved = _portal_pattern_texture(portal, pcfg)
-				var pattern_tex = resolved[0]
-				# A plain opening has nothing to cast. Skip rather than draw an
-				# empty quad.
-				if pattern_tex == null:
+					collapsed += 1
 					continue
 				var tile_ft = max(0.5, float(pcfg.get("tile", 2.5)))
 				var h_b = (bottom_ft / fps) * tier_px
@@ -1194,6 +1214,7 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 				var d0 = h_b / tan_hi
 				var d1 = min(h_t / max(0.02, tan_lo), d_cap)
 				if d1 <= d0 + 1.0:
+					degenerate += 1
 					continue
 				var v0 = (d0 * tan_c) / tile_px
 				var v1 = (d1 * tan_c) / tile_px
@@ -1204,8 +1225,19 @@ func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
 					"d0_px": d0, "d1_px": d1,
 					"has_pattern": 1.0},
 					_projection_shader)
+	# Logged whenever the feature is ENGAGED at all (a group allocated a
+	# projection root), not only when something was drawn. The old `quads > 0`
+	# gate made the most likely owner-facing failure — ticked the switch, saw
+	# nothing — completely silent.
 	if quads > 0:
+		# Leading text shape preserved: it doubles as a reload canary.
 		outputlog("projected patterns: %d quad(s) built, %d clamped by wall height" % [quads, clamped], 1)
+	elif roots > 0:
+		# Level 0: this IS the diagnostic. Says which skip swallowed the portals.
+		outputlog(("projected patterns: 0 quad(s) built from %d projecting portal(s) in %d group(s)" +
+			" — %d skipped: no Light pattern (a plain opening casts nothing), %d collapsed band" +
+			" (top <= bottom), %d degenerate footprint") % [
+			portals, roots, no_pattern, collapsed, degenerate], 0)
 
 # A black MUL polygon in the beam mask: multiplies the white base (and any
 # beam quads) to 0 inside the region. Vertex colours are already black; the

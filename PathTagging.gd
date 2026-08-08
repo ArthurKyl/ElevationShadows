@@ -521,15 +521,66 @@ func caster_fingerprint() -> int:
 				var pnid = core.get_node_id(portal)
 				if pnid != null:
 					var pstore = _get_portal_store()
-					if not (pstore.has(pnid) and pstore[pnid] is Dictionary and pstore[pnid].has("open")):
-						pstore[pnid] = {
-							"open": new_portal_open_default,
-							"project": new_portal_project_default,
-						}
-						outputlog("portal %s: stamped open-for-sunlight = %s, project = %s (PortalTool defaults)" % [
-							pnid, str(new_portal_open_default), str(new_portal_project_default)], 1)
+					if not (pstore.has(pnid) and pstore[pnid] is Dictionary):
+						pstore[pnid] = {}
+					# "No open key" is still what makes a portal NEW here, but the
+					# entry may already exist: the Select tool's Project pattern
+					# toggle, pattern, top/bottom/tile all write through
+					# set_portal_value, which creates {project, pattern, top, ...}
+					# with NO "open". The original code REPLACED the whole entry,
+					# so the moment the host wall was ticked as a caster this pass
+					# wiped an authored pattern and band back to bare defaults
+					# (bars silently vanished). MERGE instead — only absent keys
+					# are written, so a user setting is never overwritten.
+					if not pstore[pnid].has("open"):
+						var stamped = PoolStringArray()
+						pstore[pnid]["open"] = new_portal_open_default
+						stamped.append("open-for-sunlight = %s" % str(new_portal_open_default))
+						if not pstore[pnid].has("project"):
+							pstore[pnid]["project"] = new_portal_project_default
+							stamped.append("project = %s" % str(new_portal_project_default))
+						outputlog("portal %s: stamped %s (PortalTool defaults)" % [
+							pnid, stamped.join(", ")], 1)
 				h = int(h * 31 + (7 if is_portal_open(portal) else 3)) % 0x7FFFFFFF
 				h = int(h * 31 + int(portal.global_position.x * 0.53 + portal.global_position.y * 0.29)) % 0x7FFFFFFF
+	# PLACEMENT DEFAULT for portals the loop above can never reach. That loop
+	# only enters walls that already have an `enabled`/`blocks` caster entry, so
+	# a portal dropped on an UNTAGGED wall — precisely the wall this feature
+	# exists for, per the control's own tooltip — was never stamped and the
+	# PortalTool default silently did nothing. Sweep the level's Portals
+	# container as well (same route as get_unattached_portals).
+	# Deliberately narrow, and both narrowings are safety, not tidiness:
+	#  * ONLY the "project" key. is_portal_open() falls back to DD's own Closed
+	#    property when "open" is absent, so stamping "open" for every portal on
+	#    the map could flip existing doors' effective state and change how
+	#    already-saved maps render. "open" stays where it is, on casting walls.
+	#  * ONLY when the default is TRUE. false is already PORTAL_DEFAULTS'
+	#    value, so writing it is a semantic no-op that would do nothing but
+	#    bloat every saved map with an entry per portal.
+	# Writes nothing once stamped, so an unchanged map still fingerprints the
+	# same; h is untouched here by design.
+	if new_portal_project_default:
+		var plevel = global.World.GetCurrentLevel()
+		var pcontainer = null
+		if plevel != null:
+			pcontainer = plevel.get("Portals")
+		if pcontainer != null:
+			var proj_store = _get_portal_store()
+			for pchild in pcontainer.get_children():
+				if pchild == null or not is_instance_valid(pchild):
+					continue
+				# WallID is what identifies a node as a portal at all (Core.gd:95).
+				if pchild.get("WallID") == null:
+					continue
+				var cnid = core.get_node_id(pchild)
+				if cnid == null:
+					continue
+				if not (proj_store.has(cnid) and proj_store[cnid] is Dictionary):
+					proj_store[cnid] = {}
+				if proj_store[cnid].has("project"):
+					continue
+				proj_store[cnid]["project"] = true
+				outputlog("portal %s: stamped project = true (PortalTool default)" % cnid, 1)
 	# PROJECTING PORTALS are driven by the portal store, and their wall may
 	# have no caster entry at all — the loop above would never see them. Hash
 	# everything the projected quads are built from, so moving a door, editing
