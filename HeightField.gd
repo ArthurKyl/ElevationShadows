@@ -53,6 +53,14 @@ func _cap_dim() -> float:
 const CONTAINER_NAME = "ElevationShadowsHeightField"
 const DEBUG_SPRITE_NAME = "ElevationShadowsHeightDebug"
 
+# ART FOOTPRINT — "only where opacity is 100%". Not 1.0: the field rasterises at
+# ~1/6 world scale, so a bilinear tap anywhere near the art's soft edge never
+# returns an exact 1.0 even over fully opaque source texels. 0.95 keeps the
+# opaque core and drops every semi-transparent edge, which is the whole point:
+# no partial-height ground, hence no unartworked mini-steps casting their own
+# shadows. See ArtFootprint.shader.
+const ART_ALPHA_THRESHOLD = 0.95
+
 # ---------------------------------------------------------------------------
 # PER-LAYER SLOTS
 # ---------------------------------------------------------------------------
@@ -112,6 +120,12 @@ var _blocker = null
 var _side_suppress = {}
 var _smooth_shader = null
 var _mask_shader = null
+var _artfoot_shader = null
+# Per slot, the tallest path that contributed an ART FOOTPRINT. Bounds the
+# footprint target's own additive overlap when two same-layer paths' artwork
+# crosses (HeightSmooth's `art_clamp`), and is read back by the probes so they
+# combine exactly the way the blur pass does.
+var _slot_art_max = []
 var _debug_sprites = []
 var _map_rect = null      # true canvas bounds, for "is this endpoint at the edge"
 var _raster_rect = null   # render-target bounds; >= _map_rect so nothing is clipped
@@ -141,6 +155,9 @@ func initialise():
 	_mask_shader = ResourceLoader.load(global.Root + "shaders/MaskChannel.shader", "Shader", true)
 	if _mask_shader == null:
 		outputlog("WARNING: MaskChannel.shader failed to load — no 'Art above shadow'", 0)
+	_artfoot_shader = ResourceLoader.load(global.Root + "shaders/ArtFootprint.shader", "Shader", true)
+	if _artfoot_shader == null:
+		outputlog("WARNING: ArtFootprint.shader failed to load — contour art will not raise ground", 0)
 
 func _resolve_map_rect():
 	if global == null or global.World == null:
@@ -185,8 +202,20 @@ func _compute_raster_rect() -> Rect2:
 			rect = rect.expand(p)
 	# Cap expansion at two tiers beyond the canvas on every side.
 	rect = rect.clip(_map_rect.grow(tier_px * 2.0))
-	# Small margin so boundary-snapped endpoints stay inside the target.
-	rect = rect.grow(48.0)
+	# Small margin so boundary-snapped endpoints stay inside the target — and, for
+	# the ART FOOTPRINT, enough room for the widest artwork to reach half its
+	# width past its own spine. The rect only ever expanded to caster POINTS, so a
+	# contour drawn near the canvas edge would have its footprint sliced off at the
+	# target boundary while the rest of the map got one, leaving the old hard band
+	# alive along the edges only.
+	var margin = 48.0
+	for path in path_tagging.get_caster_nodes():
+		if not _has_art_footprint(path):
+			continue
+		margin = max(margin, _art_half_width(path))
+	rect = rect.grow(margin)
+	if margin > 48.0:
+		outputlog("raster margin %.0f px (widest contour art half-width)" % margin, 1)
 	if rect.size != _map_rect.size:
 		outputlog("raster rect %s (canvas was %s) — expanded to cover off-canvas contours" % [
 			str(rect), str(_map_rect)], 0)
@@ -1114,6 +1143,11 @@ func _make_raster_chain(vp_size: Vector2) -> Dictionary:
 	return {
 		"raster": vp,
 		"root": root,
+		# ART FOOTPRINT target — created lazily by _ensure_art_target, and NOT
+		# part of the additive fill raster on purpose: the blur pass combines the
+		# two with max() so a path's art can overlap its own fill for free.
+		"art": null,
+		"art_root": null,
 		"blur_h": null,
 		"blur_v": null,
 		"spr_h": null,
@@ -1151,6 +1185,11 @@ func rebuild():
 
 	var drawn = 0
 	var skipped = 0
+	var art_raised = 0
+	var art_candidates = 0
+	_slot_art_max = []
+	for _i in range(_groups.size()):
+		_slot_art_max.append(0.0)
 	# (raster rect was already computed from these casters above)
 
 	for gi in range(_groups.size()):
@@ -1225,9 +1264,26 @@ func rebuild():
 				drawn += 1
 				group_drawn += 1
 
+			# ART FOOTPRINT — only now, after the fill actually rasterised. A
+			# contour whose closure failed (`polys.size() == 0` above) must not
+			# get one either: art elevation with no fill under it is a floating
+			# ridge, and its far edge would cast a shadow back across the hill.
+			if _has_art_footprint(path):
+				art_candidates += 1
+				if _draw_art_footprint(chain, gi, channel, path, height, vp_size) > 0:
+					art_raised += 1
+
 		outputlog("slot %d: layer %d -> chain %d channel %s, %d caster(s), %d polygon(s)" % [
 			gi, int(group["layer"]), int(gi / SLOTS_PER_CHAIN), ["R", "G", "B"][channel],
 			group["casters"].size(), group_drawn], 0)
+
+	# THE RELOAD CANARY for this feature. `[artfoot v3]` = the max-combine build;
+	# `v1`/`v2.1` in the log means an older, rejected branch is loaded.
+	var clamp_parts = PoolStringArray()
+	for gi in range(_slot_art_max.size()):
+		clamp_parts.append("%.2f" % _slot_art_max[gi])
+	outputlog("art footprint [artfoot v3]: %d of %d contour path(s) raised onto their own art (alpha >= %.2f) | per-slot clamp tiers: %s" % [
+		art_raised, art_candidates, ART_ALPHA_THRESHOLD, clamp_parts.join(" / ")], 0)
 
 	_build_smooth_passes(vp_size)
 	_build_art_masks(vp_size)
@@ -1235,7 +1291,7 @@ func rebuild():
 
 	_viewport_count = 0
 	for chain in _chains:
-		for key in ["raster", "blur_h", "blur_v"]:
+		for key in ["raster", "art", "blur_h", "blur_v"]:
 			if chain[key] != null and is_instance_valid(chain[key]):
 				_viewport_count += 1
 	for mc in _mask_chains:
@@ -1267,7 +1323,14 @@ func _log_histogram():
 	if _chains.size() == 0:
 		return
 
+	# Fill raster AND art footprint, kept index-aligned: every probe below has to
+	# combine them exactly the way HeightSmooth's first pass does
+	# (max(fill, min(art, clamp))), or it reports a field the march never sees.
+	# The raw raster alone would show none of the art footprint at all — the
+	# HANDOFF's standing rule, learned from the melted wall strip: probes must
+	# read what the consumer reads.
 	var imgs = []
+	var art_imgs = []
 	for chain in _chains:
 		var vp = chain["raster"]
 		if vp == null or not is_instance_valid(vp):
@@ -1280,6 +1343,14 @@ func _log_histogram():
 			continue
 		img.lock()
 		imgs.append(img)
+		var aimg = null
+		if chain["art"] != null and is_instance_valid(chain["art"]):
+			var atex = chain["art"].get_texture()
+			if atex != null:
+				aimg = atex.get_data()
+				if aimg != null:
+					aimg.lock()
+		art_imgs.append(aimg)
 
 	if imgs.size() == 0:
 		outputlog("histogram: render target not readable yet", 0)
@@ -1301,14 +1372,15 @@ func _log_histogram():
 			var total = 0.0
 			for ci in range(imgs.size()):
 				var col = imgs[ci].get_pixel(x, y)
+				var acol = null
+				if art_imgs[ci] != null:
+					acol = art_imgs[ci].get_pixel(x, y)
 				for k in range(SLOTS_PER_CHAIN):
-					var v = col.r
-					if k == 1:
-						v = col.g
-					elif k == 2:
-						v = col.b
-					total += v
 					var slot = ci * SLOTS_PER_CHAIN + k
+					var v = _chan(col, k)
+					if acol != null and slot < _slot_art_max.size():
+						v = max(v, min(_chan(acol, k), _slot_art_max[slot] / HEIGHT_DIVISOR))
+					total += v
 					if slot < slot_hits.size() and v * HEIGHT_DIVISOR > 0.05:
 						slot_hits[slot] += 1
 			var tiers = total * HEIGHT_DIVISOR
@@ -1321,6 +1393,9 @@ func _log_histogram():
 		y += step
 	for img in imgs:
 		img.unlock()
+	for img in art_imgs:
+		if img != null:
+			img.unlock()
 
 	var keys = counts.keys()
 	keys.sort()
@@ -1345,7 +1420,7 @@ func _log_histogram():
 	# the analytic bound only.
 	outputlog("max stacked elevation measured: %.2f tiers (sparse grid, informative only)" % observed, 0)
 
-	_log_mask_probe(imgs)
+	_log_mask_probe(imgs, art_imgs)
 
 # MASK/FIELD ALIGNMENT PROBE. Diagnoses "the shadow starts N px away from the
 # art" without eyeballing: for the first slot with mask coverage, find the row
@@ -1356,7 +1431,7 @@ func _log_histogram():
 # 0/1 band with hard edges, the art's texture alpha did not reach the mask (a
 # solid Line2D strip); if they ramp with texture detail, the mask is honest and
 # any gap is geometry (step vs art placement), not masking.
-func _log_mask_probe(raster_imgs: Array):
+func _log_mask_probe(raster_imgs: Array, art_imgs: Array = []):
 	if _mask_chains.size() == 0 or _groups.size() == 0:
 		return
 	var mask_imgs = {}
@@ -1376,6 +1451,9 @@ func _log_mask_probe(raster_imgs: Array):
 
 	for img in raster_imgs:
 		img.lock()
+	for img in art_imgs:
+		if img != null:
+			img.lock()
 
 	# Coverage and widest run per slot; remember the first slot worth profiling.
 	# ALSO: the FIELD's peak height under each slot's mask. The tier histogram
@@ -1393,6 +1471,7 @@ func _log_mask_probe(raster_imgs: Array):
 		var w = mimg.get_width()
 		var h = mimg.get_height()
 		var fimg = raster_imgs[ci] if ci < raster_imgs.size() else null
+		var aimg = art_imgs[ci] if ci < art_imgs.size() else null
 
 		var hits = 0
 		var samples = 0
@@ -1400,6 +1479,8 @@ func _log_mask_probe(raster_imgs: Array):
 		var best_run = 0
 		var best_start = -1
 		var fpeak = 0.0
+		var masked = 0
+		var bare = 0
 		var step = max(1, int(h / 96))
 		var y = 0
 		while y < h:
@@ -1417,16 +1498,26 @@ func _log_mask_probe(raster_imgs: Array):
 						best_y = y
 						best_start = start
 					if fimg != null:
-						var fv = _chan(fimg.get_pixel(x, y), ch) * HEIGHT_DIVISOR
+						var fv = _field_chan(fimg, aimg, x, y, ch, gi) * HEIGHT_DIVISOR
 						if fv > fpeak:
 							fpeak = fv
+						# THE ACCEPT TEST for the art footprint, in one number:
+						# every masked sample must now stand on raised ground.
+						# On `main` eight of them sat over field 0.0 — the outer
+						# half of the art over ground the field called low, which
+						# is exactly what let a higher layer's shadow qualify
+						# there and draw a line across the art.
+						if fv <= 0.0:
+							bare += 1
+						masked += 1
 				else:
 					run = 0
 				samples += 1
 			y += step
-		outputlog("mask probe slot %d/layer %d: coverage %.2f%% widest run %d texels (%.0f world px) at row %d | field peak under mask %.2f tiers" % [
+		outputlog("mask probe slot %d/layer %d: coverage %.2f%% widest run %d texels (%.0f world px) at row %d | field peak under mask %.2f tiers | %d of %d masked samples on BARE ground (%.1f%% — want 0)" % [
 			gi, int(_groups[gi]["layer"]), 100.0 * hits / max(1, samples),
-			best_run, best_run / max(0.0001, _vp_scale), best_y, fpeak], 0)
+			best_run, best_run / max(0.0001, _vp_scale), best_y, fpeak,
+			bare, masked, 100.0 * bare / max(1, masked)], 0)
 		if profile == null and best_run > 4:
 			profile = {"gi": gi, "ci": ci, "ch": ch, "y": best_y,
 				"run": best_run, "start": best_start, "w": w}
@@ -1441,6 +1532,7 @@ func _log_mask_probe(raster_imgs: Array):
 		var w = profile["w"]
 		var mimg = mask_imgs[ci]
 		var fimg = raster_imgs[ci] if ci < raster_imgs.size() else null
+		var aimg = art_imgs[ci] if ci < art_imgs.size() else null
 		if fimg != null:
 			# Window: the run plus margin either side, 40 sample points.
 			var margin = int(max(4, best_run / 2))
@@ -1452,11 +1544,11 @@ func _log_mask_probe(raster_imgs: Array):
 			for k in range(n):
 				var xi = x0 + int(float(k) * float(x1 - x0) / float(n - 1))
 				mvals.append("%.2f" % _chan(mimg.get_pixel(xi, best_y), ch))
-				fvals.append("%.1f" % (_chan(fimg.get_pixel(xi, best_y), ch) * HEIGHT_DIVISOR))
+				fvals.append("%.1f" % (_field_chan(fimg, aimg, xi, best_y, ch, gi) * HEIGHT_DIVISOR))
 			# Where the field step sits inside the same window.
 			var f_edge = -1
 			for xi in range(x0, x1 + 1):
-				if _chan(fimg.get_pixel(xi, best_y), ch) * HEIGHT_DIVISOR > 0.25:
+				if _field_chan(fimg, aimg, xi, best_y, ch, gi) * HEIGHT_DIVISOR > 0.25:
 					f_edge = xi
 					break
 			outputlog("mask probe slot %d row %d window %d..%d (world x %.0f..%.0f):" % [
@@ -1474,8 +1566,20 @@ func _log_mask_probe(raster_imgs: Array):
 
 	for img in raster_imgs:
 		img.unlock()
+	for img in art_imgs:
+		if img != null:
+			img.unlock()
 	for ci in mask_imgs.keys():
 		mask_imgs[ci].unlock()
+
+# One channel of the field AS THE MARCH SEES IT: the fill raster combined with
+# the art footprint the same way HeightSmooth's horizontal pass combines them.
+# `aimg` null (no footprint on this chain) degrades to the plain fill.
+func _field_chan(fimg, aimg, x: int, y: int, ch: int, slot: int) -> float:
+	var v = _chan(fimg.get_pixel(x, y), ch)
+	if aimg == null or slot >= _slot_art_max.size():
+		return v
+	return max(v, min(_chan(aimg.get_pixel(x, y), ch), _slot_art_max[slot] / HEIGHT_DIVISOR))
 
 func _chan(c: Color, ch: int) -> float:
 	if ch == 0:
@@ -1497,12 +1601,28 @@ func _build_smooth_passes(vp_size: Vector2):
 
 	for ci in range(_chains.size()):
 		var chain = _chains[ci]
-		# Pass 1: horizontal.
+		# Pass 1: horizontal — and the ART FOOTPRINT COMBINE. The footprint is
+		# max()ed into the field here, before any smoothing, so the art's raised
+		# ground and the fill's are blurred together as one surface.
+		var art_tex = null
+		var art_clamp = Vector3(0.0, 0.0, 0.0)
+		if chain["art"] != null and is_instance_valid(chain["art"]):
+			art_tex = chain["art"].get_texture()
+			for k in range(SLOTS_PER_CHAIN):
+				var slot = ci * SLOTS_PER_CHAIN + k
+				if slot < _slot_art_max.size():
+					var v = _slot_art_max[slot] / HEIGHT_DIVISOR
+					if k == 0:
+						art_clamp.x = v
+					elif k == 1:
+						art_clamp.y = v
+					else:
+						art_clamp.z = v
 		var pass_h = _make_blur_viewport(vp_size, chain["raster"].get_texture(),
-			Vector2(1.0, 0.0), texel, taps, blend)
+			Vector2(1.0, 0.0), texel, taps, blend, art_tex, art_clamp)
 		chain["blur_h"] = pass_h["vp"]
 		chain["spr_h"] = pass_h["spr"]
-		# Pass 2: vertical, reading pass 1.
+		# Pass 2: vertical, reading pass 1 — already combined, so no art here.
 		var pass_v = _make_blur_viewport(vp_size, pass_h["vp"].get_texture(),
 			Vector2(0.0, 1.0), texel, taps, blend)
 		chain["blur_v"] = pass_v["vp"]
@@ -1512,7 +1632,8 @@ func _build_smooth_passes(vp_size: Vector2):
 		_chains.size(), str(vp_size), blend, taps], 0)
 
 func _make_blur_viewport(vp_size: Vector2, source_tex, dir: Vector2,
-	texel: Vector2, taps: int, sigma: float) -> Dictionary:
+	texel: Vector2, taps: int, sigma: float,
+	art_tex = null, art_clamp: Vector3 = Vector3(0.0, 0.0, 0.0)) -> Dictionary:
 
 	var vp = Viewport.new()
 	vp.size = vp_size
@@ -1528,6 +1649,14 @@ func _make_blur_viewport(vp_size: Vector2, source_tex, dir: Vector2,
 	mat.set_shader_param("texel_size", texel)
 	mat.set_shader_param("taps", taps)
 	mat.set_shader_param("sigma", max(0.35, sigma))
+	# `use_art` must be an explicit 0 when there is no footprint: an unbound
+	# sampler2D reads as WHITE in Godot 3, and max(field, white) would return a
+	# saturated field everywhere.
+	mat.set_shader_param("use_art", 1.0 if art_tex != null else 0.0)
+	mat.set_shader_param("art_clamp", art_clamp)
+	if art_tex != null:
+		art_tex.flags = Texture.FLAG_FILTER
+		mat.set_shader_param("art_tex", art_tex)
 
 	source_tex.flags = Texture.FLAG_FILTER
 
@@ -1585,27 +1714,10 @@ func _build_art_masks(vp_size: Vector2):
 			# A path IS a Line2D; a wall's art lives in its child Line2D
 			# segments (already portal-gapped). Copy whichever carries the art.
 			for src in _art_lines(path):
-				var copy = Line2D.new()
-				copy.points = src.points
-				copy.width = src.width
-				copy.texture = src.texture
-				# Match how DD stretches the texture along the line, or the mask
-				# will not align with what is drawn on screen.
-				for prop in ["texture_mode", "joint_mode", "begin_cap_mode", "end_cap_mode",
-					"round_precision", "sharp_limit", "antialiased"]:
-					var val = src.get(prop)
-					if val != null:
-						copy.set(prop, val)
-				var curve = src.get("width_curve")
-				if curve != null:
-					copy.width_curve = curve
-				# Alpha is what matters; force full opacity so a semi-transparent
-				# line still masks its own footprint. MaskChannel.shader turns
-				# that alpha into this slot's channel.
-				copy.default_color = Color(1, 1, 1, 1)
-				copy.position = src.global_position
-				copy.rotation = src.global_rotation
-				copy.scale = src.global_scale
+				# Same offscreen twin the ART FOOTPRINT uses, so mask and
+				# footprint cannot disagree about where the art is.
+				# MaskChannel.shader turns its alpha into this slot's channel.
+				var copy = _copy_art_line(src)
 				var mat = ShaderMaterial.new()
 				mat.shader = _mask_shader
 				mat.set_shader_param("channel", chan_color)
@@ -1688,6 +1800,129 @@ func _art_lines(node) -> Array:
 			out.append(child)
 	return out
 
+# An offscreen twin of one artwork Line2D, placed in world coordinates. The
+# caller supplies the material. Both consumers of the trick share this: the
+# per-layer ART MASK and the ART FOOTPRINT must agree texel-for-texel about
+# where a path's art is, or the shadow would tuck under one boundary and start
+# at another.
+#
+# `texture_mode` and friends are copied because they decide how DD stretches the
+# texture along the line — get them wrong and the alpha edge lands somewhere
+# else entirely. `antialiased` is copied only when asked: Godot fringes the
+# WHOLE outline, inner edge included, which is harmless in a mask but sprinkles
+# height into the field.
+func _copy_art_line(src, copy_antialiased: bool = true) -> Line2D:
+	var copy = Line2D.new()
+	copy.points = src.points
+	copy.width = src.width
+	copy.texture = src.texture
+	for prop in ["texture_mode", "joint_mode", "begin_cap_mode", "end_cap_mode",
+		"round_precision", "sharp_limit"]:
+		var val = src.get(prop)
+		if val != null:
+			copy.set(prop, val)
+	if copy_antialiased:
+		var aa = src.get("antialiased")
+		if aa != null:
+			copy.antialiased = aa
+	else:
+		copy.antialiased = false
+	var curve = src.get("width_curve")
+	if curve != null:
+		copy.width_curve = curve
+	# Alpha is what matters downstream; force full opacity so a semi-transparent
+	# line still contributes its own footprint.
+	copy.default_color = Color(1, 1, 1, 1)
+	copy.position = src.global_position
+	copy.rotation = src.global_rotation
+	copy.scale = src.global_scale
+	return copy
+
+#########################################################################################################
+## ART FOOTPRINT
+#########################################################################################################
+# Raise the ground under a contour path's own artwork to that path's height.
+#
+# THE BUG THIS FIXES. The fill polygon is built from the SPINE, but the art
+# straddles it, so the outer half of every cliff texture stood over ground the
+# field called low. A higher layer's shadow therefore crossed the lower cliff's
+# art and drew a hard line across it, instead of staying hidden under the art
+# and emerging at the texture's own alpha edge.
+#
+# ONLY CONTOUR PATHS. Wall nodes and paths in "Wall (both)" already rasterise a
+# strip of the FULL art width, symmetric about the spine (_path_strip_polygons
+# takes its half-width from the Line2D's width), so the asymmetry cannot arise
+# for them and a second footprint would only fight the blur-safe widening.
+func _has_art_footprint(path) -> bool:
+	if path_tagging.is_wall_node(path):
+		return false
+	if int(path_tagging.get_config(path).get("side", 0)) == 2:
+		return false
+	return path is Line2D
+
+func _art_half_width(path) -> float:
+	var half = 0.0
+	for line in _art_lines(path):
+		var s = line.global_scale
+		half = max(half, float(line.width) * 0.5 * max(abs(s.x), abs(s.y)))
+	return half
+
+# Lazily create this chain's footprint target. Lazy because a map of pure wall
+# casters needs none, and a render target this size is not free.
+func _ensure_art_target(chain: Dictionary, vp_size: Vector2) -> Node2D:
+	if chain["art"] != null and is_instance_valid(chain["art"]):
+		return chain["art_root"]
+	var vp = Viewport.new()
+	vp.size = vp_size
+	vp.usage = Viewport.USAGE_2D
+	vp.transparent_bg = true
+	vp.disable_3d = true
+	vp.render_target_v_flip = true
+	vp.render_target_update_mode = Viewport.UPDATE_ONCE
+
+	var root = Node2D.new()
+	root.scale = Vector2(_vp_scale, _vp_scale)
+	root.position = -_raster_rect.position * _vp_scale
+	vp.add_child(root)
+	global.Editor.add_child(vp)
+
+	chain["art"] = vp
+	chain["art_root"] = root
+	return root
+
+# Draw one contour path's artwork into its chain's footprint target, at its own
+# height, in its own slot's channel. Returns the number of Line2D copies made.
+func _draw_art_footprint(chain: Dictionary, slot: int, channel: int, path,
+	height: float, vp_size: Vector2) -> int:
+
+	if _artfoot_shader == null:
+		return 0
+	var lines = _art_lines(path)
+	if lines.size() == 0:
+		return 0
+	var root = _ensure_art_target(chain, vp_size)
+	var chan_color = [Vector3(1, 0, 0), Vector3(0, 1, 0), Vector3(0, 0, 1)][channel]
+	var made = 0
+	for src in lines:
+		var copy = _copy_art_line(src, false)
+		# No texture, or texture_mode = None (LineBuilder emits no UVs at all in
+		# that mode): there is no alpha to threshold, and what DD draws is a
+		# solid line of full width, so all of it raises ground.
+		var tex_mode = src.get("texture_mode")
+		var textured = src.texture != null and tex_mode != Line2D.LINE_TEXTURE_NONE
+		var mat = ShaderMaterial.new()
+		mat.shader = _artfoot_shader
+		mat.set_shader_param("channel", chan_color)
+		mat.set_shader_param("elevation", height / HEIGHT_DIVISOR)
+		mat.set_shader_param("alpha_threshold", ART_ALPHA_THRESHOLD)
+		mat.set_shader_param("use_texture", 1.0 if textured else 0.0)
+		copy.material = mat
+		root.add_child(copy)
+		made += 1
+	if made > 0 and height > _slot_art_max[slot]:
+		_slot_art_max[slot] = height
+	return made
+
 func _make_mask_chain(vp_size: Vector2) -> Dictionary:
 	var vp = Viewport.new()
 	vp.size = vp_size
@@ -1734,7 +1969,7 @@ func freeze():
 func _all_viewports() -> Array:
 	var out = []
 	for chain in _chains:
-		for key in ["raster", "blur_h", "blur_v"]:
+		for key in ["raster", "art", "blur_h", "blur_v"]:
 			var vp = chain[key]
 			if vp != null and is_instance_valid(vp):
 				out.append(vp)
@@ -1780,7 +2015,7 @@ func get_raw_texture(chain_index: int = 0):
 
 func _teardown_viewport():
 	for chain in _chains:
-		for key in ["blur_v", "blur_h", "raster"]:
+		for key in ["blur_v", "blur_h", "art", "raster"]:
 			var vp = chain[key]
 			if vp != null and is_instance_valid(vp):
 				if vp.get_parent() != null:
@@ -1799,6 +2034,7 @@ func _teardown_viewport():
 	_mask_chains = []
 	_blocker = null
 	_groups = []
+	_slot_art_max = []
 	_side_suppress = {}
 	_viewport_count = 0
 
@@ -1856,6 +2092,11 @@ func _refresh_debug_sprite():
 			str(tex_size), str(sprite.position), str(sprite.scale),
 			str(Vector2(tex_size.x * sprite.scale.x, tex_size.y * sprite.scale.y)),
 			str(_raster_rect.size), int(HEIGHT_DIVISOR), HEIGHT_DIVISOR / 4.0], 0)
+	# The overlay shows the FILL raster only. The art footprint is a separate
+	# target combined at blur time (max, not add), so its absence here is not a
+	# sign that it failed — read the `art footprint [artfoot v3]` line and the
+	# mask probe's BARE-ground count for that.
+	outputlog("debug overlay shows the fill raster only; art footprint is combined downstream", 1)
 
 func _remove_debug_sprite():
 	for sprite in _debug_sprites:
