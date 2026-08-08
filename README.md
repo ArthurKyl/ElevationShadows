@@ -188,6 +188,11 @@ data, so it all survives save and reload.
   layers 100–400, and the shadow inherits that position, so no per-wall or
   per-portal setting can push it under. Paths are unaffected; only wall-based
   casters have this.
+
+  **Workaround:** put the thing that should stay clear on **Above Roofs (900)**,
+  which sits above the wall container — a walkway crossing over a gate reads
+  correctly there. Keep it a plain object; an *elevation caster* on 700/900 has
+  its own trouble with wall openings below it.
 - **Follow DD roof sun inverts one axis.** East/west follows correctly,
   north/south is flipped, so roof shading and elevation shadows disagree. Set
   the mod's own Direction until this is fixed.
