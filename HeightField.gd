@@ -99,6 +99,9 @@ const MAX_SLOTS = 6
 
 # [{ "layer": float, "slot": int, "casters": [Line2D] }], ascending by layer.
 var _groups = []
+# node_id -> true for walls that are in a group ONLY to host a projecting
+# portal. They must not raise the height field.
+var _projector_only = {}
 # One entry per raster chain:
 #   {"raster":Viewport, "root":Node2D, "blur_h":Viewport, "blur_v":Viewport,
 #    "spr_h":Sprite, "spr_v":Sprite}
@@ -400,20 +403,15 @@ func _path_strip_polygons(path, inset: float, cut_portals: bool = true, ring_out
 # the wall (global_position ± direction * radius, verified in the assembly).
 # The cut rectangle overhangs the strip on both sides, so it always bisects a
 # piece rather than punching a hole (which could not be triangulated).
-# The OPEN portals of a wall: WallID children plus proximity-adopted
-# freestanding ones, filtered through PathTagging.is_portal_open (the mod's
-# "Open for sunlight" toggle, falling back to DD's Closed flag). ONE
-# collection shared by the blocker gap cutter and ShadowRenderer's beam-mask
-# builder, so blocker gaps and light beams can never disagree about which
-# doors exist (the earlier split meant an unsnapped door got a gap but no
-# beam). Via PathTagging.get_wall_portals — Wall.Portals itself is a C#
-# List<T> that Godot's bridge cannot marshal (get() returns null, silently).
-func get_open_wall_portals(path, half: float = 64.0) -> Array:
+# Via PathTagging.get_wall_portals — Wall.Portals itself is a C# List<T> that
+# Godot's bridge cannot marshal (get() returns null, silently).
+# Every portal belonging to this wall, open or closed.
+# Portals without a living WallID (freestanding, or their wall was redrawn)
+# are adopted by proximity: DD only writes WallID when the portal snapped onto
+# the wall at placement, and a door dropped onto the art without snapping
+# should still let light through.
+func get_all_wall_portals(path, half: float = 64.0) -> Array:
 	var portals = path_tagging.get_wall_portals(path, false)
-	# Portals without a living WallID (freestanding, or their wall was
-	# redrawn) are adopted by proximity: DD only writes WallID when the portal
-	# snapped onto the wall at placement, and a door dropped onto the art
-	# without snapping should still let light through.
 	var pts = _world_points(path)
 	if pts.size() >= 2:
 		for portal in path_tagging.get_unattached_portals():
@@ -428,6 +426,19 @@ func get_open_wall_portals(path, half: float = 64.0) -> Array:
 	for portal in portals:
 		if portal == null or not is_instance_valid(portal):
 			continue
+		out.append(portal)
+	return out
+
+# The OPEN portals of a wall: WallID children plus proximity-adopted
+# freestanding ones, filtered through PathTagging.is_portal_open (the mod's
+# "Open for sunlight" toggle, falling back to DD's Closed flag). ONE
+# collection shared by the blocker gap cutter and ShadowRenderer's beam-mask
+# builder, so blocker gaps and light beams can never disagree about which
+# doors exist (the earlier split meant an unsnapped door got a gap but no
+# beam).
+func get_open_wall_portals(path, half: float = 64.0) -> Array:
+	var out = []
+	for portal in get_all_wall_portals(path, half):
 		if path_tagging.is_portal_open(portal):
 			out.append(portal)
 	return out
@@ -1080,7 +1091,21 @@ func _make_polygon_mesh(poly, c: Color):
 
 func _build_groups():
 	_groups = []
+	_projector_only = {}
 	var casters = path_tagging.get_caster_nodes()
+	# Walls that host a projecting portal but cast nothing join their layer's
+	# group so a ghost prop exists to draw the projection onto. Without this a
+	# map with no enabled casters returns zero groups and there is nowhere to
+	# draw at all. They are recorded so the fill loop skips them.
+	var projectors = path_tagging.get_projector_walls()
+	for wall in projectors:
+		var wnid = core.get_node_id(wall)
+		if wnid == null:
+			continue
+		_projector_only[wnid] = true
+		casters.append(wall)
+	if projectors.size() > 0:
+		outputlog("%d projector-only wall(s) joined (host a projecting portal, cast nothing)" % projectors.size(), 0)
 	if casters.size() == 0:
 		return
 
@@ -1143,6 +1168,13 @@ func get_group_casters(index: int) -> Array:
 	if index < 0 or index >= _groups.size():
 		return []
 	return _groups[index]["casters"]
+
+# Is this caster in its group only to host a projecting portal? Such a wall
+# contributes NO elevation, no art mask, no blocker and no side suppression —
+# it exists so the group (and its ghost prop) exists at all.
+func is_projector_only(path) -> bool:
+	var nid = core.get_node_id(path)
+	return nid != null and _projector_only.has(nid)
 
 func get_chain_count() -> int:
 	return _chains.size()
@@ -1240,6 +1272,11 @@ func rebuild():
 		var group_drawn = 0
 
 		for path in group["casters"]:
+			# Projector-only walls are here for the ghost prop, not the field.
+			# Rasterising one would raise the terrain under a house nobody
+			# tagged and cast a real shadow from it.
+			if is_projector_only(path):
+				continue
 			var cfg = path_tagging.get_config(path)
 			var height = float(cfg.get("height", 1.0))
 			var side = int(cfg.get("side", 0))
