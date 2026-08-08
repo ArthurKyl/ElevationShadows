@@ -78,6 +78,11 @@ with a pattern tiled into it — crates, cages, grates.
   interior stays completely lit; Side B shades the inside only, for courtyards.
 - **Multi-tier stacking.** Three 5 ft contours make a 15 ft summit, and the
   shadow length follows.
+- **Walls don't pile up.** Where two walls cross, the corner is as tall as the
+  taller wall — not the sum of both — so a city wall with buildings and stairs
+  tacked onto it has no bumps at the junctions. Want a taller stretch? Draw a
+  segment over it and give that segment the height you want. Ground still
+  lifts what stands on it: a 10 ft wall on a 20 ft cliff is 30 ft.
 - **Respects your layering.** A layer-4 path's shadow darkens layer-2 cliff art.
   Objects escape or receive a shadow with Dungeondraft's own **Bring to front /
   Send to back** — per object, saved with the map. Cliff art can hide the
@@ -193,13 +198,6 @@ data, so it all survives save and reload.
   which sits above the wall container — a walkway crossing over a gate reads
   correctly there. Keep it a plain object; an *elevation caster* on 700/900 has
   its own trouble with wall openings below it.
-- **Walls stack where they overlap.** Two 5 ft walls crossing at a corner make
-  that corner 10 ft, and it casts a sudden longer shadow from one small patch.
-  Heights combine by adding — which is what makes nested contours stack into a
-  summit — and wall strips currently go through the same combine. It shows up
-  most when a map grows by addition: a long city wall, then buildings and
-  stairs tacked onto it, each junction a bump. Nudging one wall so the ends
-  meet rather than overlap avoids it for now.
 - **Follow DD roof sun inverts one axis.** East/west follows correctly,
   north/south is flipped, so roof shading and elevation shadows disagree. Set
   the mod's own Direction until this is fixed.
