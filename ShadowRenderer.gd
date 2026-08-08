@@ -144,6 +144,10 @@ func initialise():
 		global.Root + "shaders/PatternShadow.shader", "Shader", true)
 	if _pattern_shader == null:
 		outputlog("WARNING: PatternShadow.shader failed to load — no portal beams/patterns", 0)
+	_projection_shader = ResourceLoader.load(
+		global.Root + "shaders/ProjectedPattern.shader", "Shader", true)
+	if _projection_shader == null:
+		outputlog("WARNING: ProjectedPattern.shader failed to load — no projected patterns", 0)
 	_make_pattern_textures()
 	outputlog("shaders loaded", 0)
 
@@ -156,6 +160,7 @@ func initialise():
 # thresholding ("anything that isn't 0% opacity blocks at full strength").
 
 var _pattern_shader = null
+var _projection_shader = null
 var _pattern_textures = []
 
 func _make_pattern_textures():
@@ -279,6 +284,11 @@ func clear():
 			if bvp.get_parent() != null:
 				bvp.get_parent().remove_child(bvp)
 			bvp.queue_free()
+		var pvp = g.get("proj_vp")
+		if pvp != null and is_instance_valid(pvp):
+			if pvp.get_parent() != null:
+				pvp.get_parent().remove_child(pvp)
+			pvp.queue_free()
 	_groups = []
 
 func rebuild():
@@ -410,6 +420,28 @@ func rebuild():
 			beam_vp.add_child(quad_root)
 			global.Editor.add_child(beam_vp)
 
+		# --- Projection target: patterns cast onto ground nothing shades. ---
+		# TRANSPARENT base with plain MIX, not the beam mask's white + MUL: this
+		# one ADDS shadow rather than carving it, and overlapping portals must
+		# compose "over" (p2 + p1*(1-p2)) so two crossing patterns saturate
+		# instead of doubling.
+		var proj_vp = null
+		var proj_root = null
+		if _group_needs_projection(gi):
+			proj_vp = Viewport.new()
+			proj_vp.size = bake_size
+			proj_vp.usage = Viewport.USAGE_2D
+			proj_vp.transparent_bg = true
+			proj_vp.disable_3d = true
+			proj_vp.render_target_v_flip = true
+			proj_vp.render_target_update_mode = Viewport.UPDATE_ALWAYS
+			proj_root = Node2D.new()
+			var ps = vp_scale * bake_scale
+			proj_root.scale = Vector2(ps, ps)
+			proj_root.position = -raster_rect.position * ps
+			proj_vp.add_child(proj_root)
+			global.Editor.add_child(proj_vp)
+
 		# --- Visible node: a ghost Prop in Level.Objects displaying the bake. ---
 		var baked = bake_vp.get_texture()
 		baked.flags = Texture.FLAG_FILTER
@@ -452,6 +484,11 @@ func rebuild():
 		var disp = ShaderMaterial.new()
 		disp.shader = _display_shader
 		disp.set_shader_param("shadow_color", sun_settings.get_shadow_tint())
+		# Bound every time: an unbound sampler is undefined. `use_proj` gates it,
+		# and update_uniforms rebinds once the viewport's texture exists.
+		disp.set_shader_param("proj_tex", baked)
+		disp.set_shader_param("use_proj", 0.0)
+		disp.set_shader_param("proj_opacity", float(sun_settings.get_sun().get("opacity", 0.55)))
 		sprite.material = disp
 
 		# Put the ghost back where the user's front/back arrangement had it
@@ -466,6 +503,8 @@ func rebuild():
 			"bake_sprite": bake_sprite,
 			"beam_vp": beam_vp,
 			"quad_root": quad_root,
+			"proj_vp": proj_vp,
+			"proj_root": proj_root,
 			"material": material,
 			"prop": prop,
 			"sprite": sprite,
@@ -567,6 +606,8 @@ func _thaw_bake():
 			g["bake_vp"].render_target_update_mode = Viewport.UPDATE_ALWAYS
 		if g.get("beam_vp") != null and is_instance_valid(g["beam_vp"]):
 			g["beam_vp"].render_target_update_mode = Viewport.UPDATE_ALWAYS
+		if g.get("proj_vp") != null and is_instance_valid(g["proj_vp"]):
+			g["proj_vp"].render_target_update_mode = Viewport.UPDATE_ALWAYS
 	if _groups.size() == 0:
 		return
 	if _freeze_timer == null or not is_instance_valid(_freeze_timer):
@@ -589,6 +630,8 @@ func _freeze_bake():
 			g["bake_vp"].render_target_update_mode = Viewport.UPDATE_DISABLED
 		if g.get("beam_vp") != null and is_instance_valid(g["beam_vp"]):
 			g["beam_vp"].render_target_update_mode = Viewport.UPDATE_DISABLED
+		if g.get("proj_vp") != null and is_instance_valid(g["proj_vp"]):
+			g["proj_vp"].render_target_update_mode = Viewport.UPDATE_DISABLED
 	outputlog("%d bake(s) frozen" % _groups.size(), 1)
 
 # Read one group's baked shadow back and histogram its strength.
@@ -866,21 +909,34 @@ func update_uniforms():
 		var spr = g["sprite"]
 		if spr != null and is_instance_valid(spr) and spr.material != null:
 			spr.material.set_shader_param("shadow_color", tint)
+			# Projected patterns composite here, not in the march. Strength is
+			# applied at this end because the bake's red already carries it and
+			# the projection does not — which keeps Strength a live uniform.
+			var proj_tex = _projection_texture(g["slot"])
+			spr.material.set_shader_param("proj_tex", proj_tex if proj_tex != null else g["bake_vp"].get_texture())
+			spr.material.set_shader_param("use_proj", 1.0 if proj_tex != null else 0.0)
+			spr.material.set_shader_param("proj_opacity", float(sun.get("opacity", 0.55)))
 
 	# The beam-mask quads depend on the sun (direction, altitude, softness),
 	# so they are rebuilt with every uniform change — a handful of small
 	# meshes, cheap next to the march. They do NOT depend on opacity: the
 	# mask is RELATIVE to whatever the march baked, so Strength tracks free.
 	_rebuild_pattern_quads(tan_lo, tan_hi)
+	_rebuild_projection_quads(tan_lo, tan_hi)
 
 	# Re-run the bakes with the new parameters. Without this the visible sprites
 	# keep showing the previous march.
 	_thaw_bake()
 
-	outputlog("uniforms (%d group(s)): sun_dir=%s alt=%.1f+-%.1f (tan %.3f..%.3f) max_dist=%.0fpx steps=%d base_stride=%.1fpx (%.1f texels) growth=%.4f tiers=%.1f opacity=%.2f self_bias=%.3f attr_bias=%.3f field_b=%s tint=#%s" % [
+	var proj_groups = 0
+	for pg in _groups:
+		if pg.get("proj_vp") != null and is_instance_valid(pg["proj_vp"]):
+			proj_groups += 1
+	outputlog("uniforms (%d group(s)): sun_dir=%s alt=%.1f+-%.1f (tan %.3f..%.3f) max_dist=%.0fpx steps=%d base_stride=%.1fpx (%.1f texels) growth=%.4f tiers=%.1f opacity=%.2f self_bias=%.3f attr_bias=%.3f field_b=%s tint=#%s proj=%d" % [
 		_groups.size(), str(sun_dir), altitude, spread, tan_lo, tan_hi, max_dist, steps,
 		base_stride, base_stride / max(0.001, texel_px), growth, max_tiers,
-		float(sun.get("opacity", 0.55)), self_bias, attr_bias, str(have_b), tint.to_html(false)], 1)
+		float(sun.get("opacity", 0.55)), self_bias, attr_bias, str(have_b), tint.to_html(false),
+		proj_groups], 1)
 
 #########################################################################################################
 ## PORTAL LIGHT BEAMS — a multiplicative mask over the SOLID wall's shadow
@@ -903,6 +959,25 @@ func update_uniforms():
 # shadow, the beam wins (slightly too bright) — the march stores only the max
 # per layer, so no mask can split it. The old additive scheme double-darkened
 # the same spot; different layers are separate bakes and still darken beams.
+
+# A portal's pattern as a texture, or null for a plain opening. Shared by the
+# beam mask and the projection so the two can never disagree about what a
+# portal's pattern is. Returns [texture, used_custom, missing_custom] so the
+# caller can keep its own counters.
+func _portal_pattern_texture(portal, pcfg: Dictionary) -> Array:
+	var pattern = int(clamp(pcfg.get("pattern", 0), 0, path_tagging.PATTERN_CUSTOM))
+	if pattern == path_tagging.PATTERN_CUSTOM:
+		var pfile = str(pcfg.get("pattern_file", ""))
+		var tex = _get_custom_pattern(pfile)
+		if tex != null:
+			return [tex, true, false]
+		outputlog("portal %s: custom pattern '%s' unavailable — plain opening" % [
+			str(core.get_node_id(portal)), pfile], 1)
+		return [null, false, true]
+	if pattern > 0:
+		# int() the min — GDScript min() may hand back a float.
+		return [_pattern_textures[int(min(pattern, _pattern_textures.size() - 1))], false, false]
+	return [null, false, false]
 
 func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 	# NO early return on a missing pattern shader: the side-suppression meshes
@@ -936,6 +1011,11 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 		for caster in height_field.get_group_casters(g["slot"]):
 			if _pattern_shader == null:
 				break
+			# Projector-only walls cast nothing, so they have no shadow to carve
+			# a beam out of — and the mask multiplies the WHOLE group's bake, so
+			# a quad from one would eat a real neighbouring wall's shadow.
+			if height_field.is_projector_only(caster):
+				continue
 			if caster == null or not is_instance_valid(caster):
 				continue
 			var cfg = path_tagging.get_config(caster)
@@ -959,24 +1039,16 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 				if top_ft <= bottom_ft + 0.01:
 					continue
 				var tile_ft = max(0.5, float(pcfg.get("tile", 2.5)))
-				var pattern = int(clamp(pcfg.get("pattern", 0), 0, path_tagging.PATTERN_CUSTOM))
 				# Resolve the pattern to a texture (or null = plain opening).
 				# Custom = the user's own image, pre-thresholded to the binary
 				# contract at load; a missing/unloadable file degrades to a
 				# plain opening rather than sealing or streaking the beam.
-				var pattern_tex = null
-				if pattern == path_tagging.PATTERN_CUSTOM:
-					var pfile = str(pcfg.get("pattern_file", ""))
-					pattern_tex = _get_custom_pattern(pfile)
-					if pattern_tex != null:
-						custom_used += 1
-					else:
-						custom_missing += 1
-						outputlog("portal %s: custom pattern '%s' unavailable — plain opening" % [
-							str(core.get_node_id(portal)), pfile], 1)
-				elif pattern > 0:
-					# int() the min — GDScript min() may hand back a float.
-					pattern_tex = _pattern_textures[int(min(pattern, _pattern_textures.size() - 1))]
+				var resolved = _portal_pattern_texture(portal, pcfg)
+				var pattern_tex = resolved[0]
+				if resolved[1]:
+					custom_used += 1
+				if resolved[2]:
+					custom_missing += 1
 
 				var h_b = (bottom_ft / fps) * tier_px
 				var h_t = (top_ft / fps) * tier_px
@@ -1000,7 +1072,8 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 					{"tan_lo": tan_lo, "tan_hi": tan_hi,
 					"h_bottom_px": h_b, "h_top_px": h_t, "h_wall_px": h_w,
 					"d0_px": d0, "d1_px": d1,
-					"has_pattern": 1.0 if pattern_tex != null else 0.0})
+					"has_pattern": 1.0 if pattern_tex != null else 0.0},
+					_pattern_shader)
 
 		# ONE-SIDED WALLS: draw each suppressed region black into the same
 		# mask. blend_mul commutes, so composition with the beam quads is
@@ -1038,6 +1111,102 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 			line += ", %d custom-texture pattern(s) (%d unavailable)" % [custom_used, custom_missing]
 		outputlog(line, 1)
 
+#########################################################################################################
+## PROJECTED PORTAL PATTERNS — positive shadow where the wall shades nothing
+#########################################################################################################
+# The mirror image of the beam mask. A beam quad carves light OUT of a solid
+# wall shadow and is invisible without one; a projection quad puts the pattern's
+# BARS DOWN on their own, so a house set to shade only its exterior still gets
+# its windows' patterns on the interior floor, and a map with no elevation
+# shadows at all still gets them.
+#
+# Same parallelogram, same UV convention, same distance interpolant — only the
+# shader and the compositing differ. ShadowDisplay takes max(bake, projection),
+# so where the wall DOES shade that floor the projection is an exact no-op and
+# no "is the wall casting here?" test is needed anywhere.
+
+func _rebuild_projection_quads(tan_lo: float, tan_hi: float):
+	if _projection_shader == null:
+		return
+	var sun = sun_settings.get_sun()
+	var alt = clamp(float(sun.get("altitude", 35.0)), 1.0, 89.0)
+	var tan_c = tan(deg2rad(alt))
+	var tier_px = float(sun.get("tier_px", 256.0))
+	var fps = sun_settings.get_feet_per_square()
+	var dirv = sun_settings.get_shadow_direction()
+	var raster_rect = height_field.get_raster_rect()
+	var d_cap = raster_rect.size.length() if raster_rect != null else 100000.0
+	var quads = 0
+	var clamped = 0
+
+	for g in _groups:
+		var root = g.get("proj_root")
+		if root == null or not is_instance_valid(root):
+			continue
+		for child in root.get_children():
+			child.queue_free()
+		for caster in height_field.get_group_casters(g["slot"]):
+			if caster == null or not is_instance_valid(caster):
+				continue
+			var cfg = path_tagging.get_config(caster)
+			var wall_ft = float(cfg.get("height", 1.0)) * fps
+			for portal in height_field.get_all_wall_portals(caster):
+				if not path_tagging.is_portal_projecting(portal):
+					continue
+				var a = portal.get("Begin")
+				var b = portal.get("End")
+				if not (a is Vector2 and b is Vector2) or (b - a).length() < 1.0:
+					continue
+				var pcfg = path_tagging.get_portal_cfg(portal)
+				var want_top = float(pcfg.get("top", 8.0))
+				# The clamp to the wall's own height applies ONLY to a wall that
+				# actually casts. There it keeps the projection consistent with
+				# the real shadow the same wall throws. On a PROJECTOR-ONLY wall
+				# there is no shadow to be consistent with, and `height` is an
+				# untouched default of 1 tier — clamping an authored 8 ft opening
+				# to 5 ft against a number the user never set would silently
+				# degrade the exact case this feature exists for. So: no clamp,
+				# and the authored band is used as-is.
+				var bottom_ft = float(pcfg.get("bottom", 0.0))
+				var top_ft = max(want_top, bottom_ft)
+				if not height_field.is_projector_only(caster):
+					bottom_ft = clamp(bottom_ft, 0.0, wall_ft)
+					top_ft = clamp(want_top, bottom_ft, wall_ft)
+					if top_ft < want_top - 0.01:
+						clamped += 1
+						outputlog(("portal %s: opening top %.1f ft CLAMPED to %.1f ft by casting wall " +
+							"%s's own height — raise the wall's Height to get the full pattern") % [
+							str(core.get_node_id(portal)), want_top, top_ft,
+							str(core.get_node_id(caster))], 0)
+				if top_ft <= bottom_ft + 0.01:
+					continue
+				var resolved = _portal_pattern_texture(portal, pcfg)
+				var pattern_tex = resolved[0]
+				# A plain opening has nothing to cast. Skip rather than draw an
+				# empty quad.
+				if pattern_tex == null:
+					continue
+				var tile_ft = max(0.5, float(pcfg.get("tile", 2.5)))
+				var h_b = (bottom_ft / fps) * tier_px
+				var h_t = (top_ft / fps) * tier_px
+				var tile_px = (tile_ft / fps) * tier_px
+				var span_tiles = (b - a).length() / tile_px
+				var d0 = h_b / tan_hi
+				var d1 = min(h_t / max(0.02, tan_lo), d_cap)
+				if d1 <= d0 + 1.0:
+					continue
+				var v0 = (d0 * tan_c) / tile_px
+				var v1 = (d1 * tan_c) / tile_px
+				quads += _add_quad(root, a, b, dirv, d0, d1,
+					pattern_tex, span_tiles, v0, v1,
+					{"tan_lo": tan_lo, "tan_hi": tan_hi,
+					"h_bottom_px": h_b, "h_top_px": h_t,
+					"d0_px": d0, "d1_px": d1,
+					"has_pattern": 1.0},
+					_projection_shader)
+	if quads > 0:
+		outputlog("projected patterns: %d quad(s) built, %d clamped by wall height" % [quads, clamped], 1)
+
 # A black MUL polygon in the beam mask: multiplies the white base (and any
 # beam quads) to 0 inside the region. Vertex colours are already black; the
 # opaque base is guaranteed by the mask viewport's white ColorRect.
@@ -1056,7 +1225,7 @@ func _add_black_mesh(root, mesh):
 # flags 0 — the default ARRAY_COMPRESS_COLOR would quantise the interpolant
 # to 8 bits and band the penumbra ramps.
 func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float,
-	tex, u_tiles: float, v0: float, v1: float, params: Dictionary) -> int:
+	tex, u_tiles: float, v0: float, v1: float, params: Dictionary, shader) -> int:
 
 	var p0 = a + dirv * d0
 	var p1 = b + dirv * d0
@@ -1084,7 +1253,7 @@ func _add_quad(root, a: Vector2, b: Vector2, dirv: Vector2, d0: float, d1: float
 	if tex != null:
 		mi.texture = tex
 	var mat = ShaderMaterial.new()
-	mat.shader = _pattern_shader
+	mat.shader = shader
 	for key in params:
 		mat.set_shader_param(key, params[key])
 	mi.material = mat
@@ -1098,6 +1267,8 @@ func _group_needs_beam_mask(slot: int) -> bool:
 	if height_field.get_side_suppressors(slot).size() > 0:
 		return true
 	for caster in height_field.get_group_casters(slot):
+		if height_field.is_projector_only(caster):
+			continue
 		if caster == null or not is_instance_valid(caster):
 			continue
 		# Any WALL node is a strip caster (side 0/1 = one-sided strip); a
@@ -1107,6 +1278,33 @@ func _group_needs_beam_mask(slot: int) -> bool:
 		if height_field.get_open_wall_portals(caster).size() > 0:
 			return true
 	return false
+
+# Does this layer group carry any projecting portal? Unlike the beam mask this
+# has nothing to do with the caster's side or whether the portal is open — a
+# closed door on a wall that casts nothing still projects.
+func _group_needs_projection(slot: int) -> bool:
+	if _projection_shader == null:
+		return false
+	for caster in height_field.get_group_casters(slot):
+		if caster == null or not is_instance_valid(caster):
+			continue
+		for portal in height_field.get_all_wall_portals(caster):
+			if path_tagging.is_portal_projecting(portal):
+				return true
+	return false
+
+# The projection texture of a slot, or null if that group has none.
+func _projection_texture(slot: int):
+	for g in _groups:
+		if g["slot"] == slot:
+			var vp = g.get("proj_vp")
+			if vp == null or not is_instance_valid(vp):
+				return null
+			var t = vp.get_texture()
+			if t != null:
+				t.flags = Texture.FLAG_FILTER
+			return t
+	return null
 
 # The beam-mask texture of a slot, or null if that group has none.
 func _beam_texture(slot: int):
