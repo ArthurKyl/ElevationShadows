@@ -12,9 +12,26 @@ shader_type canvas_item;
 //
 // Red has 10 bits under the same format (8 under RGBA8), so the gradient survives
 // either way. One texture fetch per screen pixel, negligible beside the march.
+//
+// PROJECTED PORTAL PATTERNS composite here, with max() rather than a sum. The
+// projection viewport is the same size and rect as the bake, so UV maps 1:1.
+// max() is load-bearing, not a convenience: projected bars are drawn at the SAME
+// strength as a real wall shadow, so wherever real shadow already covers that
+// floor the max is the value already there and the projection is an exact no-op.
+// That is what lets the feature run unconditionally and never double-darken.
+// `proj_opacity` is the march's own `opacity` (Strength); the bake's red already
+// has it baked in, the projection does not, so it is applied here — which also
+// keeps Strength a live uniform with no rebuild, like the tint.
 
 uniform vec4 shadow_color : hint_color = vec4(0.0, 0.0, 0.0, 1.0);
+uniform sampler2D proj_tex;
+uniform float use_proj = 0.0;
+uniform float proj_opacity = 0.55;
 
 void fragment() {
-	COLOR = vec4(shadow_color.rgb, texture(TEXTURE, UV).r);
+	float a = texture(TEXTURE, UV).r;
+	if (use_proj > 0.5) {
+		a = max(a, texture(proj_tex, UV).r * proj_opacity);
+	}
+	COLOR = vec4(shadow_color.rgb, a);
 }
