@@ -124,6 +124,10 @@ const PORTAL_DEFAULTS = {
 	# types. "" = none; an unloadable path falls back to a plain opening at
 	# rebuild time (ShadowRenderer warns in the log).
 	"pattern_file": "",
+	# Draw this portal's pattern as shadow on ground its wall does not shade
+	# (a house set to shade only its exterior still gets window patterns on the
+	# interior floor). Independent of "open" — a closed door projects.
+	"project": false,
 }
 
 const PATTERN_NAMES = ["None (open)", "Bars", "Window panes", "Diamond lattice", "Plus holes", "Checker"]
@@ -138,6 +142,7 @@ var new_path_defaults = {}
 # What newly placed portals get stamped with (PortalTool panel toggle).
 # Session-sticky, like DD's own tool options.
 var new_portal_open_default = true
+var new_portal_project_default = false
 
 var _syncing = false
 var _current_path = null
@@ -279,6 +284,69 @@ func is_portal_open(portal) -> bool:
 	if closed != null:
 		return not bool(closed)
 	return false
+
+# Does this portal draw its pattern as shadow on ground its wall does not
+# shade? Unlike `open`, there is no DD flag to fall back on — it is purely the
+# mod's, and defaults off so saved maps are unchanged.
+func is_portal_projecting(portal) -> bool:
+	var nid = core.get_node_id(portal)
+	if nid == null:
+		return false
+	var store = _get_portal_store()
+	if store.has(nid) and store[nid] is Dictionary:
+		return bool(store[nid].get("project", false))
+	return false
+
+# Every projecting portal on the CURRENT level, with its host wall resolved
+# from WallID (more robust than get_parent). Driven by the PORTAL store, not
+# the caster store: the whole point is that the wall may never have been
+# tagged. `wall` is null for an orphan whose WallID points at a deleted or
+# redrawn wall — those are picked up by proximity in HeightField instead.
+func get_projecting_portal_entries() -> Array:
+	var out = []
+	var store = _get_portal_store()
+	var level = global.World.GetCurrentLevel()
+	for pnid in store.keys():
+		if not (store[pnid] is Dictionary and bool(store[pnid].get("project", false))):
+			continue
+		if not global.World.HasNodeID(pnid):
+			continue
+		var portal = global.World.GetNodeByID(pnid)
+		if portal == null or not is_instance_valid(portal):
+			continue
+		if level != null and not _is_descendant_of(portal, level):
+			continue
+		var wall = null
+		var wid = portal.get("WallID")
+		if wid != null and global.World.HasNodeID(wid):
+			var w = global.World.GetNodeByID(wid)
+			if w != null and is_instance_valid(w):
+				wall = w
+		out.append({"portal": portal, "wall": wall})
+	return out
+
+# Walls that exist ONLY to host a projecting portal: living, visible, on this
+# level, and NOT already enabled casters (an enabled caster is in the group
+# anyway, and promoting it twice would duplicate it). These join their layer's
+# group so a ghost prop exists to draw onto, and contribute nothing else.
+func get_projector_walls() -> Array:
+	var out = []
+	var seen = {}
+	var store = _get_store()
+	for entry in get_projecting_portal_entries():
+		var wall = entry["wall"]
+		if wall == null:
+			continue
+		var wnid = core.get_node_id(wall)
+		if wnid == null or seen.has(wnid):
+			continue
+		if store.has(wnid) and store[wnid] is Dictionary and store[wnid].get("enabled", false):
+			continue
+		if wall.has_method("is_visible_in_tree") and not wall.is_visible_in_tree():
+			continue
+		seen[wnid] = true
+		out.append(wall)
+	return out
 
 func get_config(node) -> Dictionary:
 	var cfg = CASTER_DEFAULTS.duplicate()
@@ -454,11 +522,27 @@ func caster_fingerprint() -> int:
 				if pnid != null:
 					var pstore = _get_portal_store()
 					if not (pstore.has(pnid) and pstore[pnid] is Dictionary and pstore[pnid].has("open")):
-						pstore[pnid] = {"open": new_portal_open_default}
-						outputlog("portal %s: stamped open-for-sunlight = %s (PortalTool default)" % [
-							pnid, str(new_portal_open_default)], 1)
+						pstore[pnid] = {
+							"open": new_portal_open_default,
+							"project": new_portal_project_default,
+						}
+						outputlog("portal %s: stamped open-for-sunlight = %s, project = %s (PortalTool defaults)" % [
+							pnid, str(new_portal_open_default), str(new_portal_project_default)], 1)
 				h = int(h * 31 + (7 if is_portal_open(portal) else 3)) % 0x7FFFFFFF
 				h = int(h * 31 + int(portal.global_position.x * 0.53 + portal.global_position.y * 0.29)) % 0x7FFFFFFF
+	# PROJECTING PORTALS are driven by the portal store, and their wall may
+	# have no caster entry at all — the loop above would never see them. Hash
+	# everything the projected quads are built from, so moving a door, editing
+	# its band or deleting it re-runs on the next poll like any other change.
+	for entry in get_projecting_portal_entries():
+		var portal = entry["portal"]
+		var pcfg = get_portal_cfg(portal)
+		h = int(h * 31 + str(core.get_node_id(portal)).hash()) % 0x7FFFFFFF
+		h = int(h * 31 + int(portal.global_position.x * 0.53 + portal.global_position.y * 0.29)) % 0x7FFFFFFF
+		h = int(h * 31 + int(float(pcfg.get("bottom", 0.0)) * 10.0)
+			+ int(float(pcfg.get("top", 8.0)) * 10.0) * 31
+			+ int(float(pcfg.get("tile", 2.5)) * 10.0) * 71
+			+ int(pcfg.get("pattern", 0)) * 131) % 0x7FFFFFFF
 	return h
 
 # Effective "Art above shadow" for a path: the stored value if the user set it,
@@ -547,12 +631,28 @@ func _build_portal_tool_ui():
 	toggle.connect("toggled", self, "_on_portal_tool_default_toggled")
 	row.add_child(toggle)
 	container.add_child(row)
+	var prow2 = HBoxContainer.new()
+	var plabel2 = Label.new()
+	plabel2.text = "Project pattern"
+	plabel2.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	plabel2.hint_tooltip = ("New portals cast their pattern onto the floor even where\n" +
+		"the wall casts no shadow. Change a placed portal later via\nthe Select tool.")
+	prow2.add_child(plabel2)
+	var ptoggle2 = CheckButton.new()
+	ptoggle2.pressed = new_portal_project_default
+	ptoggle2.connect("toggled", self, "_on_portal_tool_project_default_toggled")
+	prow2.add_child(ptoggle2)
+	container.add_child(prow2)
 	align.add_child(container)
 	outputlog("PortalTool UI added", 0)
 
 func _on_portal_tool_default_toggled(pressed):
 	new_portal_open_default = pressed
 	outputlog("new-portal default open-for-sunlight = %s" % str(pressed), 0)
+
+func _on_portal_tool_project_default_toggled(pressed):
+	new_portal_project_default = pressed
+	outputlog("new-portal default project-pattern = %s" % str(pressed), 0)
 
 func _build_path_tool_ui():
 	var panel = global.Editor.Toolset.GetToolPanel("PathTool")
@@ -746,6 +846,25 @@ func _build_select_tool_ui():
 	prow.add_child(ptoggle)
 	pcontainer.add_child(prow)
 
+	# The "fake shadow": project this portal's pattern onto ground its wall
+	# does not shade. Independent of the toggle above — a CLOSED door projects.
+	var jrow = HBoxContainer.new()
+	var jlabel = Label.new()
+	jlabel.text = "Project pattern"
+	jlabel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	jlabel.hint_tooltip = ("Cast this opening's pattern onto the floor even where the\n" +
+		"wall casts no shadow — a house set to shade only its outside\n" +
+		"still gets window patterns on the inside floor, and it works\n" +
+		"with no elevation shadows on the map at all.\n" +
+		"Independent of \"Open for sunlight\": a closed door projects.\n" +
+		"Needs a Light pattern below — a plain opening has nothing to cast.")
+	jrow.add_child(jlabel)
+	var jtoggle = CheckButton.new()
+	jtoggle.connect("toggled", self, "_on_st_portal_project_toggled")
+	jrow.add_child(jtoggle)
+	pcontainer.add_child(jrow)
+	st_ui["portal_project"] = jtoggle
+
 	# Light pattern + opening geometry: what shape the light takes through
 	# this opening, and where the opening sits in the wall's face.
 	var pat_row = HBoxContainer.new()
@@ -883,6 +1002,7 @@ func on_selection_changed():
 			_syncing = true
 			st_ui["portal_open"].pressed = is_portal_open(portal)
 			if st_ui.has("portal_pattern"):
+				st_ui["portal_project"].pressed = bool(pcfg.get("project", false))
 				st_ui["portal_pattern"].selected = int(pcfg.get("pattern", 0))
 				st_ui["portal_top"].value = float(pcfg.get("top", 8.0))
 				st_ui["portal_bottom"].value = float(pcfg.get("bottom", 0.0))
@@ -1079,6 +1199,24 @@ func _on_st_portal_open_toggled(pressed):
 		store[nid] = {}
 	store[nid]["open"] = pressed
 	outputlog("portal %s: open for sunlight = %s" % [nid, str(pressed)], 0)
+	if core != null:
+		core.request_rebuild(false, true)
+
+func _on_st_portal_project_toggled(pressed):
+	if _syncing or _current_portal == null:
+		return
+	var nid = core.get_node_id(_current_portal)
+	if nid == null:
+		outputlog("Cannot store portal state: portal has no node_id", 0)
+		return
+	var store = _get_portal_store()
+	if not (store.has(nid) and store[nid] is Dictionary):
+		store[nid] = {}
+	store[nid]["project"] = pressed
+	outputlog("portal %s: project pattern = %s" % [nid, str(pressed)], 0)
+	# FIELD rebuild, not uniforms-only: turning this on may promote an untagged
+	# wall to a projector-only caster, which creates a layer group and a ghost
+	# prop that update_uniforms alone would never build.
 	if core != null:
 		core.request_rebuild(false, true)
 
