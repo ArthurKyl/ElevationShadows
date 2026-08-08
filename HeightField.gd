@@ -61,6 +61,12 @@ const DEBUG_SPRITE_NAME = "ElevationShadowsHeightDebug"
 # shadows. See ArtFootprint.shader.
 const ART_ALPHA_THRESHOLD = 0.95
 
+# "Something stands here" — half a tier, in channel units. Used by the
+# art-over-fill ridge probe to decide whether a texel carries fill / footprint at
+# all; the smallest usable height is a whole tier, so half of one is well clear
+# of both zero and the 10-bit rounding of the render target.
+const FILL_EPS = 0.5 / HEIGHT_DIVISOR
+
 # ---------------------------------------------------------------------------
 # PER-LAYER SLOTS
 # ---------------------------------------------------------------------------
@@ -644,7 +650,12 @@ func build_suppress_band_mesh(entry: Dictionary, dist: float) -> Dictionary:
 	arrays[ArrayMesh.ARRAY_VERTEX] = verts
 	arrays[ArrayMesh.ARRAY_COLOR] = colors
 	var mesh = ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	# Flags 0 for ARRAY_COMPRESS_VERTEX's sake: the default stores 2D positions as
+	# half floats, whose spacing is 8 units above 8192, so band pieces meant to
+	# butt against each other on the far side of a large map snapped to an 8-px
+	# lattice and could part company at a joint. No colour interpolant here (the
+	# band is flat black), but the geometry has to close.
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], 0)
 	return {"mesh": mesh, "area": area}
 
 func _band_tri(tris: Array, a: Vector2, b: Vector2, c: Vector2):
@@ -1025,7 +1036,37 @@ func _make_polygon_mesh(poly, c: Color):
 	arrays[ArrayMesh.ARRAY_VERTEX] = verts
 	arrays[ArrayMesh.ARRAY_COLOR] = colors
 	var mesh = ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	# COMPRESS FLAGS 0 — LOAD-BEARING, this is not a micro-optimisation.
+	#
+	# The default (ARRAY_COMPRESS_DEFAULT) sets ARRAY_COMPRESS_COLOR, which stores
+	# each vertex colour as `int(c * 255.0)` — a TRUNCATION, not a rounding. This
+	# colour is not decoration: it IS the height, as tiers/HEIGHT_DIVISOR. So
+	#     h=4 -> 0.0625  -> int(15.94) = 15 -> 15/255 -> 3.754 tiers
+	#     h=2 -> 0.03125 -> int( 7.97) =  7 ->  7/255 -> 1.752 tiers
+	#     h=1 ->           int( 3.98) =  3 ->  3/255 -> 0.751 tiers
+	# every fill rasterised about a QUARTER TIER SHORT, always short, never long.
+	#
+	# On its own that was a quiet 6% error in shadow length. It became a visible
+	# defect when the ART FOOTPRINT arrived: the footprint's height comes from a
+	# shader uniform (`elevation`), which is exact, so `max(fill, art)` in
+	# HeightSmooth picked the ART everywhere the two overlapped and every art band
+	# stood ~0.25 tiers PROUD of the plateau it lies on — a ridge with a drop on
+	# its INNER side, casting a short soft shadow back across the caster's own high
+	# ground. That is Arthur's "it behaves as if I have it on Side A, casting
+	# shadow inside of itself, in random spots": the lip is 0.25 tiers against a
+	# `self_bias` of 0.22-0.26, so it clears the march's noise gate only where the
+	# local blur and sampling nudge it over — random spots, and stronger at low
+	# Diffusion (self_bias = 0.10 + level_blend * 0.04). The mod's own probe row
+	# printed it in the log and it was read as a success: `field: 3.8 x11 4.0 x18
+	# 3.8 x11` under a mask that starts and ends inside the plateau.
+	#
+	# ARRAY_COMPRESS_VERTEX is in the same default and matters here too: it stores
+	# 2D positions as HALF FLOATS, whose spacing is 8 units above 8192, so contour
+	# vertices on the far side of a large map snapped to an 8-world-px lattice and
+	# the fill boundary drifted off the art centreline by up to 4 px.
+	#
+	# ShadowRenderer._add_quad already passes 0 for the same class of reason.
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], 0)
 	return mesh
 
 #########################################################################################################
@@ -1277,12 +1318,14 @@ func rebuild():
 			gi, int(group["layer"]), int(gi / SLOTS_PER_CHAIN), ["R", "G", "B"][channel],
 			group["casters"].size(), group_drawn], 0)
 
-	# THE RELOAD CANARY for this feature. `[artfoot v3]` = the max-combine build;
-	# `v1`/`v2.1` in the log means an older, rejected branch is loaded.
+	# THE RELOAD CANARY for this feature. `[artfoot v4]` = exact-height fills
+	# (compress flags 0), so the max-combine is a no-op where a path's art lies on
+	# its own fill; `v3` is the build whose art bands stood a quarter tier proud of
+	# their own plateau; `v1`/`v2.1` are the older rejected branches.
 	var clamp_parts = PoolStringArray()
 	for gi in range(_slot_art_max.size()):
 		clamp_parts.append("%.2f" % _slot_art_max[gi])
-	outputlog("art footprint [artfoot v3] %s: %d of %d contour path(s) raised onto their own art (alpha >= %.2f) | per-slot clamp tiers: %s" % [
+	outputlog("art footprint [artfoot v4] %s: %d of %d contour path(s) raised onto their own art (alpha >= %.2f) | per-slot clamp tiers: %s" % [
 		"ON" if bool(sun_settings.get_sun().get("bake_art_elevation", true)) else "OFF (Art raises elevation unticked)",
 		art_raised, art_candidates, ART_ALPHA_THRESHOLD, clamp_parts.join(" / ")], 0)
 
@@ -1361,8 +1404,14 @@ func _log_histogram():
 	var h = imgs[0].get_height()
 	var counts = {}
 	var slot_hits = []
+	var proud_hits = []
+	var proud_samples = []
+	var proud_max = []
 	for _i in range(_groups.size()):
 		slot_hits.append(0)
+		proud_hits.append(0)
+		proud_samples.append(0)
+		proud_max.append(0.0)
 	var samples = 0
 	var observed = 0.0
 	var step = max(1, int(min(w, h) / 96))
@@ -1380,7 +1429,26 @@ func _log_histogram():
 					var slot = ci * SLOTS_PER_CHAIN + k
 					var v = _chan(col, k)
 					if acol != null and slot < _slot_art_max.size():
-						v = max(v, min(_chan(acol, k), _slot_art_max[slot] / HEIGHT_DIVISOR))
+						var a = min(_chan(acol, k), _slot_art_max[slot] / HEIGHT_DIVISOR)
+						# ART-OVER-FILL RIDGES — the number this round exists for.
+						# Count every texel where the footprint stands STRICTLY
+						# ABOVE the fill underneath it. `max()` picks the art there,
+						# so each one is a lip inside the caster's own plateau with
+						# a drop on its inner side — the thing that casts shadow
+						# into high ground. The 8-bit vertex-colour truncation put
+						# +0.25 tiers of it under essentially EVERY art band; with
+						# exact fills that must fall to ~0, and anything LEFT is
+						# real geometry (two same-slot paths of different heights
+						# whose art overlaps and ADDS, bounded by the per-slot
+						# clamp) which shows up as a whole-tier `max +`, not 0.25.
+						if v > FILL_EPS and a > FILL_EPS and slot < proud_hits.size():
+							proud_samples[slot] += 1
+							var excess = (a - v) * HEIGHT_DIVISOR
+							if excess > 0.05:
+								proud_hits[slot] += 1
+								if excess > proud_max[slot]:
+									proud_max[slot] = excess
+						v = max(v, a)
 					total += v
 					if slot < slot_hits.size() and v * HEIGHT_DIVISOR > 0.05:
 						slot_hits[slot] += 1
@@ -1410,6 +1478,22 @@ func _log_histogram():
 		cov.append("slot %d/layer %d: %.1f%%" % [
 			gi, int(_groups[gi]["layer"]), 100.0 * slot_hits[gi] / max(1, samples)])
 	outputlog("per-layer field coverage: %s" % cov.join(" | "), 0)
+
+	# THE ACCEPT TEST for this round. Denominator = grid samples where BOTH the
+	# fill and the footprint are present; numerator = those where the footprint
+	# stands above the fill by more than 0.05 tiers, i.e. a ridge inside the
+	# caster's own plateau. Under the 8-bit truncation this was ~100% at +0.25;
+	# with exact fills it must be ~0%.
+	var proud = PoolStringArray()
+	var proud_total = 0
+	var proud_denom = 0
+	for gi in range(_groups.size()):
+		proud_total += proud_hits[gi]
+		proud_denom += proud_samples[gi]
+		proud.append("slot %d: %d/%d max +%.2f t" % [
+			gi, proud_hits[gi], proud_samples[gi], proud_max[gi]])
+	outputlog("art-over-fill ridges: %d of %d overlap sample(s) where the footprint stands ABOVE its own fill (%.1f%% — want ~0) | %s" % [
+		proud_total, proud_denom, 100.0 * proud_total / max(1, proud_denom), proud.join(" | ")], 0)
 
 	_observed_max_tiers = observed
 	# INFORMATIVE ONLY. This number used to cap the march's stack bound and
@@ -1576,6 +1660,14 @@ func _log_mask_probe(raster_imgs: Array, art_imgs: Array = []):
 # One channel of the field AS THE MARCH SEES IT: the fill raster combined with
 # the art footprint the same way HeightSmooth's horizontal pass combines them.
 # `aimg` null (no footprint on this chain) degrades to the plain fill.
+#
+# This row is where the bug was VISIBLE all along and got read as a success:
+#   field: 3.8 x11  4.0 x18  3.8 x11
+# under a mask that both starts and ends inside the plateau. 3.8 is the fill
+# (h=4, truncated to 8 bits by ARRAY_COMPRESS_COLOR); 4.0 is the art footprint
+# (exact). A quarter-tier ridge, with a drop on its inner side, along every art
+# band on the map. When a probe row steps UP in the middle and back DOWN, that is
+# a ridge, whatever the headline count says.
 func _field_chan(fimg, aimg, x: int, y: int, ch: int, slot: int) -> float:
 	var v = _chan(fimg.get_pixel(x, y), ch)
 	if aimg == null or slot >= _slot_art_max.size():

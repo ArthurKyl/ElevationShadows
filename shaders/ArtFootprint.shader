@@ -32,6 +32,16 @@ render_mode blend_add;
 // pulled the footprint off the art it was supposed to follow). Neither problem
 // exists once the combine is a max.
 //
+// THE max() HAS ONE PRECONDITION, and it was violated for a whole round: on the
+// ground a path's art shares with its OWN fill the two must carry the SAME
+// number, or max() picks whichever is a hair higher and the loser's surface
+// becomes a step. The fill's height rides in a vertex colour, and Godot's
+// default ARRAY_COMPRESS_COLOR truncates that to 8 bits, so the fill rasterised
+// ~0.25 tiers LOW while `elevation` here is exact — every art band on the map
+// stood a quarter tier proud of its own plateau and cast a short soft shadow
+// inward. HeightField._make_polygon_mesh now passes compress flags 0. Any future
+// change to how the fill's height is carried has to preserve this equality.
+//
 // Godot 3 trap (see HANDOFF §4): touching COLOR in a canvas_item fragment
 // compiles out the automatic texture multiply, so TEXTURE must be sampled here
 // explicitly — reading COLOR alone would yield a solid alpha-1 band with no

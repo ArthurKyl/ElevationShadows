@@ -40,6 +40,21 @@ uniform float sigma = 2.0;
 // target (canvas has no MAX blend), and the clamp bounds that at a height which
 // legitimately occurs on that layer, so an overlap can never manufacture a
 // cliff taller than anything actually drawn there.
+//
+// THE max() ONLY WORKS IF THE TWO SIDES CARRY THE SAME NUMBER (2026-08-08).
+// `max` is safe as an overlap rule precisely because a footprint texel lying on
+// its own path's fill is the SAME height as that fill, so the max is a no-op and
+// the field is flat across the art. That was not true until now: the fill's
+// height rode in a VERTEX COLOUR, and Godot's default ARRAY_COMPRESS_COLOR
+// truncated it to 8 bits (`int(c * 255.0)`), so h=4 rasterised at 3.754 tiers
+// while this shader's `art_tex` — written from an exact float uniform — carried
+// 4.004. max() therefore picked the ART everywhere the two met, and every art
+// band stood a quarter tier PROUD of the plateau it lies on: a ridge with a drop
+// on its INNER side, casting a short soft shadow back across the caster's own
+// high ground. That is the "it behaves as if I have it on Side A, casting shadow
+// inside of itself, in random spots" defect. Fixed at source in
+// HeightField._make_polygon_mesh (compress flags 0); do not reintroduce
+// compressed vertex colours in the height raster.
 uniform sampler2D art_tex;
 uniform vec3 art_clamp = vec3(0.0);        // tiers/HEIGHT_DIVISOR, per channel
 uniform float use_art = 0.0;
