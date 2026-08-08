@@ -115,13 +115,22 @@ func side_label(node, side: int) -> String:
 # wall below the sill and above the lintel still shades — which is what makes
 # beams end at a realistic distance instead of streaking across the map.
 const PORTAL_DEFAULTS = {
-	"pattern": 0,     # index into ShadowRenderer.PATTERN_NAMES; 0 = plain opening
+	"pattern": 0,     # index into PATTERN_NAMES, or PATTERN_CUSTOM; 0 = plain opening
 	"top": 8.0,       # ft — lintel height (door tops out here)
 	"bottom": 0.0,    # ft — sill height (0 for doors, raise for windows)
 	"tile": 2.5,      # ft — pattern tile size (one bar/pane/plus per tile)
+	# Image path for the "Custom texture" pattern. A plain STRING (like the sun
+	# tint's hex string) — DD's map serialization is only trusted with simple
+	# types. "" = none; an unloadable path falls back to a plain opening at
+	# rebuild time (ShadowRenderer warns in the log).
+	"pattern_file": "",
 }
 
 const PATTERN_NAMES = ["None (open)", "Bars", "Window panes", "Diamond lattice", "Plus holes", "Checker"]
+# One past the generated patterns: the "Custom texture..." OptionButton entry.
+# Arthur's contract for custom images: any texel with non-0% opacity blocks
+# light at 100% (enforced by ShadowRenderer's load-time threshold).
+const PATTERN_CUSTOM = 6
 
 var pt_ui = {}      # PathTool controls (defaults for new paths)
 var st_ui = {}      # SelectTool controls (edits current selection)
@@ -133,6 +142,9 @@ var new_portal_open_default = true
 var _syncing = false
 var _current_path = null
 var _current_portal = null
+# Custom-pattern image picker (lazy singleton) and the portal it was opened for.
+var _pattern_file_dialog = null
+var _pattern_file_portal = null
 
 func outputlog(msg, level = 0):
 	if core != null:
@@ -747,11 +759,34 @@ func _build_select_tool_ui():
 	var pat_option = OptionButton.new()
 	for name in PATTERN_NAMES:
 		pat_option.add_item(name)
+	pat_option.add_item("Custom texture...")  # index == PATTERN_CUSTOM
 	pat_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	pat_option.connect("item_selected", self, "_on_st_portal_pattern_selected")
 	pat_row.add_child(pat_option)
 	pcontainer.add_child(pat_row)
 	st_ui["portal_pattern"] = pat_option
+
+	# The Custom texture's image: one compact row (the panel is height-budgeted),
+	# shown only while Custom is the selected pattern. Alpha is the blocker, same
+	# contract as the generated patterns — but binary: any alpha > 0 blocks fully.
+	var cust_row = HBoxContainer.new()
+	var cust_btn = Button.new()
+	cust_btn.text = "Image..."
+	cust_btn.hint_tooltip = ("Pick a PNG/WebP whose alpha is the pattern: any pixel with\n" +
+		"non-0% opacity blocks the light completely, fully transparent\n" +
+		"pixels let it through. Tiles at the Pattern size above.")
+	cust_btn.connect("pressed", self, "_on_st_portal_pattern_file_pressed")
+	cust_row.add_child(cust_btn)
+	var cust_label = Label.new()
+	cust_label.text = "(no image)"
+	cust_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cust_label.clip_text = true
+	cust_label.modulate = Color(1, 1, 1, 0.6)
+	cust_row.add_child(cust_label)
+	cust_row.visible = false
+	pcontainer.add_child(cust_row)
+	st_ui["portal_custom_row"] = cust_row
+	st_ui["portal_custom_label"] = cust_label
 
 	var top_row = HBoxContainer.new()
 	var top_label = Label.new()
@@ -852,6 +887,7 @@ func on_selection_changed():
 				st_ui["portal_top"].value = float(pcfg.get("top", 8.0))
 				st_ui["portal_bottom"].value = float(pcfg.get("bottom", 0.0))
 				st_ui["portal_tile"].value = float(pcfg.get("tile", 2.5))
+				_update_custom_pattern_row(pcfg)
 			_syncing = false
 
 	_current_path = path
@@ -948,6 +984,73 @@ func _on_st_portal_pattern_selected(index):
 	if _syncing or _current_portal == null:
 		return
 	set_portal_value(_current_portal, "pattern", int(index))
+	_update_custom_pattern_row(get_portal_cfg(_current_portal))
+	# First time Custom is picked on a portal there is nothing to show yet —
+	# go straight to the image picker instead of a silent plain opening.
+	if int(index) == PATTERN_CUSTOM and str(get_portal_cfg(_current_portal).get("pattern_file", "")) == "":
+		_open_pattern_file_dialog()
+
+func _on_st_portal_pattern_file_pressed():
+	if _current_portal == null:
+		return
+	_open_pattern_file_dialog()
+
+# A plain Godot FileDialog over the filesystem (created once, reused). DD has
+# no reusable asset-browser dialog surfaced to mods, and the pattern image is
+# a mod-side resource anyway — it never needs to live in an asset pack.
+func _open_pattern_file_dialog():
+	if _pattern_file_dialog == null or not is_instance_valid(_pattern_file_dialog):
+		var dlg = FileDialog.new()
+		dlg.mode = FileDialog.MODE_OPEN_FILE
+		dlg.access = FileDialog.ACCESS_FILESYSTEM
+		dlg.window_title = "Light pattern image (alpha > 0 blocks light)"
+		dlg.resizable = true
+		dlg.rect_min_size = Vector2(700, 500)
+		dlg.filters = PoolStringArray([
+			"*.png ; PNG images", "*.webp ; WebP images",
+			"*.jpg, *.jpeg ; JPEG images (no alpha — blocks everywhere)",
+			"*.bmp ; BMP images", "*.tga ; TGA images"])
+		dlg.connect("file_selected", self, "_on_st_portal_pattern_file_selected")
+		# Start somewhere sane; the dialog keeps its last directory afterwards.
+		var home = OS.get_environment("HOME")
+		if home != "":
+			dlg.current_dir = home
+		global.Editor.add_child(dlg)
+		_pattern_file_dialog = dlg
+	# The dialog outlives the selection — remember whose portal it was opened
+	# for, so a selection change while it is up cannot retarget the pick.
+	_pattern_file_portal = _current_portal
+	_pattern_file_dialog.popup_centered()
+
+func _on_st_portal_pattern_file_selected(path):
+	var portal = _pattern_file_portal
+	_pattern_file_portal = null
+	if portal == null or not is_instance_valid(portal):
+		outputlog("pattern image picked but the portal is gone — ignored", 0)
+		return
+	# Re-picking a path must beat the renderer's texture cache (the file may
+	# have been edited on disk since the last load).
+	if shadow_renderer != null:
+		shadow_renderer.invalidate_custom_pattern(str(path))
+	set_portal_value(portal, "pattern_file", str(path))
+	if int(get_portal_cfg(portal).get("pattern", 0)) != PATTERN_CUSTOM:
+		set_portal_value(portal, "pattern", PATTERN_CUSTOM)
+	if portal == _current_portal:
+		_syncing = true
+		st_ui["portal_pattern"].selected = PATTERN_CUSTOM
+		_syncing = false
+		_update_custom_pattern_row(get_portal_cfg(portal))
+
+# The pick-file row: only visible while Custom is the selected pattern, label
+# shows the image's basename (full path in the tooltip).
+func _update_custom_pattern_row(pcfg: Dictionary):
+	if not st_ui.has("portal_custom_row"):
+		return
+	var is_custom = int(pcfg.get("pattern", 0)) == PATTERN_CUSTOM
+	st_ui["portal_custom_row"].visible = is_custom
+	var pfile = str(pcfg.get("pattern_file", ""))
+	st_ui["portal_custom_label"].text = pfile.get_file() if pfile != "" else "(no image)"
+	st_ui["portal_custom_label"].hint_tooltip = pfile
 
 func _on_st_portal_top_changed(value):
 	if _syncing or _current_portal == null:

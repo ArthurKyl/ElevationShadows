@@ -151,9 +151,9 @@ func initialise():
 ## PORTAL LIGHT PATTERNS
 #########################################################################################################
 # Generated at runtime — no asset files. Index 0 (None) is a plain opening.
-# Alpha is the blocker: opaque parts shade, transparent parts pass light. The
-# same contract a future custom-asset option would use ("anything that isn't
-# 0% opacity blocks at full strength").
+# Alpha is the blocker: opaque parts shade, transparent parts pass light — the
+# same contract the CUSTOM pattern (a user image, below) enforces by
+# thresholding ("anything that isn't 0% opacity blocks at full strength").
 
 var _pattern_shader = null
 var _pattern_textures = []
@@ -173,6 +173,63 @@ func _make_pattern_textures():
 		tex.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER)
 		_pattern_textures.append(tex)
 	outputlog("%d light patterns generated" % (_pattern_textures.size() - 1), 1)
+
+# CUSTOM patterns (pattern == PathTagging.PATTERN_CUSTOM): a user image whose
+# alpha is the blocker, under Arthur's binary contract — any texel with alpha
+# > 0 blocks at 100%, alpha == 0 passes. Enforced by THRESHOLDING THE IMAGE at
+# load (alpha byte -> 0 or 255), not in the shader: the quad shader then feeds
+# `bar` a binary texture exactly like the generated ones, FLAG_FILTER gives
+# the same anti-aliased bar edges, and PatternShadow.shader stays untouched.
+# Cached by path so the per-uniform-change quad rebuild never re-hits disk; a
+# failed load is cached as null (fall back to plain opening, warned below) —
+# re-picking the image via the UI invalidates the entry.
+var _custom_pattern_cache = {}
+
+# Cache lookup + load. Returns an ImageTexture or null (missing/unloadable).
+func _get_custom_pattern(path: String):
+	if path == "":
+		return null
+	if _custom_pattern_cache.has(path):
+		return _custom_pattern_cache[path]
+	_custom_pattern_cache[path] = _load_custom_pattern(path)
+	return _custom_pattern_cache[path]
+
+func invalidate_custom_pattern(path: String):
+	_custom_pattern_cache.erase(path)
+
+func _load_custom_pattern(path: String):
+	var img = Image.new()
+	var err = img.load(path)
+	if err != OK:
+		outputlog("WARNING: custom pattern '%s' failed to load (err %d) — its portals fall back to plain openings" % [path, err], 0)
+		return null
+	var src_w = img.get_width()
+	var src_h = img.get_height()
+	if src_w < 1 or src_h < 1:
+		outputlog("WARNING: custom pattern '%s' is empty — its portals fall back to plain openings" % path, 0)
+		return null
+	img.convert(Image.FORMAT_RGBA8)
+	# The pattern tiles at a few ft — 512 px per tile is already past what any
+	# zoom resolves, and the threshold pass below walks every texel in script.
+	if max(src_w, src_h) > 512:
+		var scale = 512.0 / float(max(src_w, src_h))
+		img.resize(int(max(1, round(src_w * scale))), int(max(1, round(src_h * scale))), Image.INTERPOLATE_BILINEAR)
+	# The binary contract, applied on the raw byte buffer (a Color-based
+	# get/set_pixel loop is several times slower): every 4th byte is alpha.
+	var data = img.get_data()
+	var blocking = 0
+	for i in range(3, data.size(), 4):
+		if data[i] != 0:
+			data[i] = 255
+			blocking += 1
+	img.create_from_data(img.get_width(), img.get_height(), false, Image.FORMAT_RGBA8, data)
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER)
+	var note = "" if max(src_w, src_h) <= 512 else " (resized from %dx%d)" % [src_w, src_h]
+	outputlog("custom pattern loaded: '%s' %dx%d%s, %.1f%% blocking texels (alpha>0 -> full block)" % [
+		path, img.get_width(), img.get_height(), note,
+		100.0 * float(blocking) / float(img.get_width() * img.get_height())], 0)
+	return tex
 
 # u across the span, v UP the opening's face; one tile = `tile` ft.
 func _pattern_alpha(idx: int, u: float, v: float) -> float:
@@ -867,6 +924,8 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 	var band_margin = (2.0 * blend + 2.0) * texel_px + 8.0
 	var quads = 0
 	var sup = 0
+	var custom_used = 0
+	var custom_missing = 0
 
 	for g in _groups:
 		var root = g.get("quad_root")
@@ -900,7 +959,24 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 				if top_ft <= bottom_ft + 0.01:
 					continue
 				var tile_ft = max(0.5, float(pcfg.get("tile", 2.5)))
-				var pattern = int(clamp(pcfg.get("pattern", 0), 0, _pattern_textures.size() - 1))
+				var pattern = int(clamp(pcfg.get("pattern", 0), 0, path_tagging.PATTERN_CUSTOM))
+				# Resolve the pattern to a texture (or null = plain opening).
+				# Custom = the user's own image, pre-thresholded to the binary
+				# contract at load; a missing/unloadable file degrades to a
+				# plain opening rather than sealing or streaking the beam.
+				var pattern_tex = null
+				if pattern == path_tagging.PATTERN_CUSTOM:
+					var pfile = str(pcfg.get("pattern_file", ""))
+					pattern_tex = _get_custom_pattern(pfile)
+					if pattern_tex != null:
+						custom_used += 1
+					else:
+						custom_missing += 1
+						outputlog("portal %s: custom pattern '%s' unavailable — plain opening" % [
+							str(core.get_node_id(portal)), pfile], 1)
+				elif pattern > 0:
+					# int() the min — GDScript min() may hand back a float.
+					pattern_tex = _pattern_textures[int(min(pattern, _pattern_textures.size() - 1))]
 
 				var h_b = (bottom_ft / fps) * tier_px
 				var h_t = (top_ft / fps) * tier_px
@@ -919,12 +995,12 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 				var v0 = (d0 * tan_c) / tile_px
 				var v1 = (d1 * tan_c) / tile_px
 				quads += _add_quad(root, a, b, dirv, d0, d1,
-					_pattern_textures[pattern] if pattern > 0 else null,
+					pattern_tex,
 					span_tiles, v0, v1,
 					{"tan_lo": tan_lo, "tan_hi": tan_hi,
 					"h_bottom_px": h_b, "h_top_px": h_t, "h_wall_px": h_w,
 					"d0_px": d0, "d1_px": d1,
-					"has_pattern": 1.0 if pattern > 0 else 0.0})
+					"has_pattern": 1.0 if pattern_tex != null else 0.0})
 
 		# ONE-SIDED WALLS: draw each suppressed region black into the same
 		# mask. blend_mul commutes, so composition with the beam quads is
@@ -955,7 +1031,12 @@ func _rebuild_pattern_quads(tan_lo: float, tan_hi: float):
 						g["slot"], entry["nid"], side_txt, d_sup,
 						100.0 * float(built["area"]) / height_field.get_map_area()], 1)
 	if quads > 0 or sup > 0:
-		outputlog("portal beams: %d mask quad(s) built, %d side-suppression mesh(es)" % [quads, sup], 1)
+		var line = "portal beams: %d mask quad(s) built, %d side-suppression mesh(es)" % [quads, sup]
+		# Custom-texture report only when in play, so the base line — a reload
+		# canary (HANDOFF §1) — keeps its exact shape on maps without customs.
+		if custom_used > 0 or custom_missing > 0:
+			line += ", %d custom-texture pattern(s) (%d unavailable)" % [custom_used, custom_missing]
+		outputlog(line, 1)
 
 # A black MUL polygon in the beam mask: multiplies the white base (and any
 # beam quads) to 0 inside the region. Vertex colours are already black; the
