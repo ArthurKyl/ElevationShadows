@@ -368,11 +368,24 @@ func get_caster_nodes() -> Array:
 # the map. Walls therefore land in a layer-600 group: shadow over every user
 # layer, wall art (Walls container, later in tree order at the same z) over
 # its own shadow.
+# Accumulated z RELATIVE TO THE LEVEL — the walk stops at the level node and
+# never adds its z_index. DD parks a non-active level at z -2000 (compare mode,
+# and while the export dialog is open), and reading through it made every layer
+# come back 2000 low: 100/200/300/400 became -1900/-1800/-1700/-1600. That
+# number is handed to the ghost prop, which is z_as_relative INSIDE that same
+# level, so the offset landed a second time and the shadows sank ~2000 below
+# the level's own terrain — the "export renders no shadows" bug. Level-relative
+# is also what every consumer here means by "layer": grouping keys, the
+# fingerprint and the below-containers warning all want the user's layer, not
+# wherever DD happens to be parking the level this frame.
 func get_caster_layer(node) -> float:
+	var level = global.World.GetCurrentLevel()
 	var z = 0
 	var walker = node
 	var guard = 0
 	while walker != null and walker is Node2D and guard < 16:
+		if level != null and walker == level:
+			break
 		z += walker.z_index
 		if not walker.z_as_relative:
 			break
