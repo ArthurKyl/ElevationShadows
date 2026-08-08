@@ -1004,6 +1004,23 @@ func _poly_bbox(poly) -> Rect2:
 		r = r.expand(p)
 	return r
 
+# Union bbox over a whole parts list, for a single conservative reject test
+# against many already-placed casters at once (see the WALL OVERLAP MAX loop).
+# Callers must pass entry["parts"] (the ORIGINALS) and compute this ONCE per
+# entry, before trimming starts — a box that shrank as pieces got cut down
+# could reject a cut that still legitimately overlaps the untrimmed remainder.
+func _parts_bbox(parts: Array) -> Rect2:
+	var r = Rect2()
+	var have_r = false
+	for poly in parts:
+		var pb = _poly_bbox(poly)
+		if not have_r:
+			r = pb
+			have_r = true
+		else:
+			r = r.merge(pb)
+	return r
+
 # Shoelace area. Sign indicates winding; callers take abs().
 func _poly_area(poly) -> float:
 	var packed = _to_packed(poly)
@@ -1392,10 +1409,17 @@ func rebuild():
 						drawn += 1
 						group_drawn += 1
 
-			# ART FOOTPRINT — only now, after the fill actually rasterised. A
-			# contour whose closure failed (`polys.size() == 0` above) must not
-			# get one either: art elevation with no fill under it is a floating
-			# ridge, and its far edge would cast a shadow back across the hill.
+			# ART FOOTPRINT — for a CONTOUR, only now, after its fill actually
+			# rasterised above. For a STRIP CASTER (wall / side == 2) the fill is
+			# deferred to the max loop below, so at this point it has NOT drawn
+			# yet — but that's safe: _has_art_footprint is contour-only by
+			# construction (it returns false for wall nodes and for side == 2
+			# paths), so no strip caster ever reaches this branch, and the
+			# deferred fill below cannot affect an art footprint that never gets
+			# requested. A contour whose closure failed (`polys.size() == 0`
+			# above) must not get one either: art elevation with no fill under it
+			# is a floating ridge, and its far edge would cast a shadow back
+			# across the hill.
 			if _has_art_footprint(path):
 				art_candidates += 1
 				if _draw_art_footprint(chain, gi, channel, path, height, vp_size) > 0:
@@ -1424,17 +1448,33 @@ func rebuild():
 			var epath = entry["path"]
 			var eheight = float(entry["height"])
 			var kept = entry["parts"]
+			# One conservative box for the WHOLE entry, computed from the
+			# originals before any trimming — see _parts_bbox. Cheap reject in
+			# front of the O(strips) already-placed loop below, which is itself
+			# in front of Clipper inside _poly_minus_bboxed.
+			var entry_bbox = _parts_bbox(entry["parts"])
+			var was_cut = false
 			for cut in placed:
 				if kept.size() == 0:
 					break
+				if not cut["bbox"].intersects(entry_bbox):
+					continue
+				was_cut = true
 				kept = _poly_minus_bboxed(kept, cut)
 			# Ear clipping SUCCEEDS on a self-touching polygon, emitting
 			# overlapping triangles that blend_add then doubles — recreating the
-			# very stacking this loop removes. Clean every subtracted piece.
-			var simple = []
-			for poly in kept:
-				for cleaned in _clean_polygon(poly):
-					simple.append(cleaned)
+			# very stacking this loop removes. Clean every subtracted piece —
+			# but only if something actually cut it: an untouched entry's parts
+			# were already cleaned above (:1379), and re-cleaning them here can
+			# only cost time, while a spurious kept.size() != entry["parts"].size()
+			# mismatch below would print a false "wall overlap max" line for a
+			# wall nothing touched.
+			var simple = kept
+			if was_cut:
+				simple = []
+				for poly in kept:
+					for cleaned in _clean_polygon(poly):
+						simple.append(cleaned)
 			kept = simple
 			var before_area = 0.0
 			for poly in entry["parts"]:
