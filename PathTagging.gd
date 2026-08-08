@@ -547,40 +547,60 @@ func caster_fingerprint() -> int:
 	# only enters walls that already have an `enabled`/`blocks` caster entry, so
 	# a portal dropped on an UNTAGGED wall — precisely the wall this feature
 	# exists for, per the control's own tooltip — was never stamped and the
-	# PortalTool default silently did nothing. Sweep the level's Portals
-	# container as well (same route as get_unattached_portals).
-	# Deliberately narrow, and both narrowings are safety, not tidiness:
-	#  * ONLY the "project" key. is_portal_open() falls back to DD's own Closed
-	#    property when "open" is absent, so stamping "open" for every portal on
-	#    the map could flip existing doors' effective state and change how
-	#    already-saved maps render. "open" stays where it is, on casting walls.
-	#  * ONLY when the default is TRUE. false is already PORTAL_DEFAULTS'
-	#    value, so writing it is a semantic no-op that would do nothing but
-	#    bloat every saved map with an entry per portal.
-	# Writes nothing once stamped, so an unchanged map still fingerprints the
-	# same; h is untouched here by design.
-	if new_portal_project_default:
-		var plevel = global.World.GetCurrentLevel()
-		var pcontainer = null
-		if plevel != null:
-			pcontainer = plevel.get("Portals")
-		if pcontainer != null:
-			var proj_store = _get_portal_store()
-			for pchild in pcontainer.get_children():
-				if pchild == null or not is_instance_valid(pchild):
+	# PortalTool default silently did nothing.
+	#
+	# Sweep the level's WALLS container (z 600; see get_caster_layer above) and
+	# ask get_wall_portals for each wall's portals, because WALL-ATTACHED PORTALS
+	# ARE CHILDREN OF THE WALL NODE (Wall::AddPortal — see that helper's header).
+	# Two earlier versions of this sweep walked the level's Portals container
+	# instead and found nothing but freestanding portals, so a window snapped onto
+	# an untagged wall was still missed. Freestanding ones are still covered:
+	# get_unattached_portals already enumerates exactly those.
+	#
+	# STAMP ON FIRST SIGHT, whatever the default's CURRENT value is. Gating the
+	# write on the default being true looks like a safe minimisation but breaks
+	# the durability promise above: pre-existing portals carry no key, so ticking
+	# the default on mid-session would retroactively turn every door and window
+	# already on the map into a projector. Writing the current value instead means
+	# the startup pass stamps `false` — which get_portal_cfg already treats as
+	# identical to absent, a semantic no-op — into every old portal, so by the
+	# time the user ticks the default on they are all immune and only genuinely
+	# new portals pick up the new value. Exactly how "open" behaves above.
+	#
+	# ONLY the "project" key, and that narrowing is safety, not tidiness:
+	# is_portal_open() falls back to DD's own Closed property when "open" is
+	# absent, so stamping "open" for every portal on the map could flip existing
+	# doors' effective state and change how already-saved maps render. "open"
+	# stays where it is, on casting walls.
+	#
+	# Writes nothing once stamped, so a settled map still fingerprints the same;
+	# h is untouched here by design.
+	var sweep_portals = []
+	var plevel = global.World.GetCurrentLevel()
+	if plevel != null:
+		var wcontainer = plevel.get("Walls")
+		if wcontainer != null:
+			for wall in wcontainer.get_children():
+				if wall == null or not is_instance_valid(wall):
 					continue
-				# WallID is what identifies a node as a portal at all (Core.gd:95).
-				if pchild.get("WallID") == null:
-					continue
-				var cnid = core.get_node_id(pchild)
-				if cnid == null:
-					continue
-				if not (proj_store.has(cnid) and proj_store[cnid] is Dictionary):
-					proj_store[cnid] = {}
-				if proj_store[cnid].has("project"):
-					continue
-				proj_store[cnid]["project"] = true
-				outputlog("portal %s: stamped project = true (PortalTool default)" % cnid, 1)
+				for wportal in get_wall_portals(wall):
+					sweep_portals.append(wportal)
+	for fportal in get_unattached_portals():
+		sweep_portals.append(fportal)
+	var proj_store = _get_portal_store()
+	for pnode in sweep_portals:
+		if pnode == null or not is_instance_valid(pnode):
+			continue
+		var cnid = core.get_node_id(pnode)
+		if cnid == null:
+			continue
+		if not (proj_store.has(cnid) and proj_store[cnid] is Dictionary):
+			proj_store[cnid] = {}
+		if proj_store[cnid].has("project"):
+			continue
+		proj_store[cnid]["project"] = new_portal_project_default
+		outputlog("portal %s: stamped project = %s (PortalTool default)" % [
+			cnid, str(new_portal_project_default)], 1)
 	# PROJECTING PORTALS are driven by the portal store, and their wall may
 	# have no caster entry at all — the loop above would never see them. Hash
 	# everything the projected quads are built from, so moving a door, editing
