@@ -27,7 +27,7 @@ var shadow_renderer = null
 # Config keys that change the shape of the elevation field (or the art mask
 # rasterised alongside it), so the field pass has to be re-run rather than just
 # the shader uniforms updated.
-const FIELD_KEYS = ["enabled", "side", "height", "art_above", "mask_inset", "blocks"]
+const FIELD_KEYS = ["enabled", "side", "height", "art_above", "mask_inset", "blocks", "extend"]
 
 const CASTER_DEFAULTS = {
 	"enabled": false,
@@ -78,6 +78,12 @@ const CASTER_DEFAULTS = {
 	# blocker too (same strip, same gap cutting), so an open door lets an
 	# outside cliff's shadow spill into the room, which is the cool part.
 	"blocks": false,
+	# "Extend off map": virtually continue this path's edge-touching ends this
+	# many GRID SQUARES past the canvas, so the shadow doesn't reveal where DD
+	# forced the drawing to stop at the map border. Geometry only — no art is
+	# drawn off-canvas. Ends away from the map edge never extend. Applies to
+	# casting AND blocking strips alike. 0 = off.
+	"extend": 0.0,
 	# REMOVED: "padding" (ShadowBuilder-era shadow start offset). Old stored
 	# values merge into the config dict harmlessly; nothing reads them.
 }
@@ -1090,6 +1096,33 @@ func _build_select_tool_ui():
 	container.add_child(inset_row)
 	st_ui["inset_slider"] = inset_slider
 	st_ui["inset_spin"] = inset_spin
+	var extend_row = HBoxContainer.new()
+	var extend_label = Label.new()
+	extend_label.text = "Extend off map"
+	extend_label.rect_min_size = Vector2(104, 0)
+	extend_label.hint_tooltip = ("Continues the shadow-casting strip past the map edge, in grid\n" +
+		"squares, so the shadow doesn't show where DD forced the drawing\n" +
+		"to stop. Only ends touching the map edge extend; nothing visible\n" +
+		"is drawn off-canvas.")
+	extend_row.add_child(extend_label)
+	var extend_slider = HSlider.new()
+	extend_slider.min_value = 0.0
+	extend_slider.max_value = 10.0
+	extend_slider.step = 0.5
+	extend_slider.value = 0.0
+	extend_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	extend_slider.connect("value_changed", self, "_on_st_extend_changed")
+	extend_row.add_child(extend_slider)
+	var extend_spin = SpinBox.new()
+	extend_spin.min_value = 0.0
+	extend_spin.max_value = 10.0
+	extend_spin.step = 0.5
+	extend_spin.value = 0.0
+	extend_spin.connect("value_changed", self, "_on_st_extend_spin_changed")
+	extend_row.add_child(extend_spin)
+	container.add_child(extend_row)
+	st_ui["extend_slider"] = extend_slider
+	st_ui["extend_spin"] = extend_spin
 
 	align.add_child(container)
 	st_ui["container"] = container
@@ -1428,6 +1461,9 @@ func on_selection_changed():
 	if st_ui.has("inset_slider"):
 		st_ui["inset_slider"].value = cfg.get("mask_inset", 5.0)
 		st_ui["inset_spin"].value = cfg.get("mask_inset", 5.0)
+	if st_ui.has("extend_slider"):
+		st_ui["extend_slider"].value = cfg.get("extend", 0.0)
+		st_ui["extend_spin"].value = cfg.get("extend", 0.0)
 	_syncing = false
 	update_length_readout()
 
@@ -1735,6 +1771,22 @@ func _on_st_inset_spin_changed(value):
 	set_config_value(_current_path, "mask_inset", value)
 	_syncing = true
 	st_ui["inset_slider"].value = value
+	_syncing = false
+
+func _on_st_extend_changed(value):
+	if _syncing or _current_path == null:
+		return
+	set_config_value(_current_path, "extend", value)
+	_syncing = true
+	st_ui["extend_spin"].value = value
+	_syncing = false
+
+func _on_st_extend_spin_changed(value):
+	if _syncing or _current_path == null:
+		return
+	set_config_value(_current_path, "extend", value)
+	_syncing = true
+	st_ui["extend_slider"].value = value
 	_syncing = false
 
 #########################################################################################################

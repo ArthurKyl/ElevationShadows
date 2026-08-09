@@ -1,7 +1,7 @@
 {
     "name": "Elevation Shadows",
     "unique_id": "arthur.ElevationShadows",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "arthur",
     "description": "A sun for your map. Tag cliffs and walls with a height in feet and get physically correct shadows: lengths from height and sun angle, real penumbra that widens with distance, multi-tier stacking, and layer-aware placement. Doors and windows open to the sun and project their pattern onto the floor; objects cast their own artwork as a shadow. Exports with the map.",
     "dd_version": "1.2.0.1"

@@ -209,8 +209,19 @@ func _compute_raster_rect() -> Rect2:
 	for node in path_tagging.get_blocker_nodes():
 		for p in _world_points(node):
 			rect = rect.expand(p)
-	# Cap expansion at two tiers beyond the canvas on every side.
-	rect = rect.clip(_map_rect.grow(tier_px * 2.0))
+	# Cap expansion at two tiers beyond the canvas on every side, PLUS the
+	# largest "Extend off map" in use. Additive, not merged: the extension is
+	# measured from the endpoint, and endpoints can already sit off-canvas
+	# (this map's contours reach x = -392), so a merged cap would slice an
+	# extended endpoint at the render-target boundary — the one failure mode
+	# that stops the extension from casting. Resolution is only spent when
+	# the slider is actually used.
+	var max_extend = 0.0
+	for path in path_tagging.get_caster_nodes():
+		max_extend = max(max_extend, float(path_tagging.get_config(path).get("extend", 0.0)))
+	for node in path_tagging.get_blocker_nodes():
+		max_extend = max(max_extend, float(path_tagging.get_config(node).get("extend", 0.0)))
+	rect = rect.clip(_map_rect.grow(tier_px * (2.0 + max_extend)))
 	# Small margin so boundary-snapped endpoints stay inside the target — and, for
 	# the ART FOOTPRINT, enough room for the widest artwork to reach half its
 	# width past its own spine. The rect only ever expanded to caster POINTS, so a
@@ -245,7 +256,10 @@ func _to_packed(arr) -> PoolVector2Array:
 		packed.append(p)
 	return packed
 
-func _world_points(path) -> PoolVector2Array:
+# include_extension=false gives the DRAWN spine only — portal proximity
+# adoption measures against it so "Extend off map" can never widen the
+# adoption zone and capture a door belonging to a neighbouring wall.
+func _world_points(path, include_extension: bool = true) -> PoolVector2Array:
 	var out = PoolVector2Array()
 	# Paths are Line2D (`points`); DD walls are Node2D with a C# `Points`
 	# property (their visible art lives in child Line2D segments).
@@ -258,7 +272,64 @@ func _world_points(path) -> PoolVector2Array:
 		out.append(path.to_global(p))
 	# Canonical ordering so Side A means the same geometric side regardless of
 	# which end the user drew from.
+	if include_extension:
+		return _extend_edge_endpoints(core.orient_points(out), path)
 	return core.orient_points(out)
+
+# "Extend off map": virtually continue an open path's edge-touching ends past
+# the canvas, so the shadow doesn't reveal where DD forced the drawing to stop.
+# Only ends AT the canvas edge extend (same tolerance the contour closure
+# uses), and only when the virtual point actually leaves the canvas — a wall
+# running parallel to the map border must not grow sideways along it. Applied
+# inside _world_points so every consumer — wall strips, contour spines,
+# blocker strips, suppressor bands, the raster expansion — sees one spine.
+func _extend_edge_endpoints(pts: PoolVector2Array, path) -> PoolVector2Array:
+	if _map_rect == null or pts.size() < 2 or _is_closed(path):
+		return pts
+	var extend_squares = float(path_tagging.get_config(path).get("extend", 0.0))
+	if extend_squares <= 0.0:
+		return pts
+	var tier_px = float(sun_settings.get_sun().get("tier_px", 256.0))
+	var reach = extend_squares * tier_px
+	var tol = tier_px * 1.5
+	var start_ext = _endpoint_extension(pts, 0, reach, tol)
+	var end_ext = _endpoint_extension(pts, pts.size() - 1, reach, tol)
+	if start_ext == null and end_ext == null:
+		return pts
+	var out = PoolVector2Array()
+	if start_ext != null:
+		out.append(start_ext)
+	for p in pts:
+		out.append(p)
+	if end_ext != null:
+		out.append(end_ext)
+	return out
+
+# The virtual point continuing a terminal segment `reach` px outward, or null
+# when this end shouldn't extend (away from the map edge, degenerate, or the
+# extension never leaves the canvas).
+func _endpoint_extension(pts: PoolVector2Array, idx: int, reach: float, tol: float):
+	var p = pts[idx]
+	if not _endpoint_at_edge(p, tol):
+		return null
+	var step = 1 if idx == 0 else -1
+	# Walk inward past coincident points to find a usable direction.
+	var i = idx + step
+	while i >= 0 and i < pts.size() and pts[i].distance_to(p) < 0.01:
+		i += step
+	if i < 0 or i >= pts.size():
+		return null
+	var dir = (p - pts[i]).normalized()
+	# Accepted limits, both rare and contained: a shallow-angled terminal
+	# segment can sweep in-canvas ground before exiting (Clipper's self-union
+	# in _clean_polygon resolves any self-crossing it causes), and a wall
+	# drawn entirely OFF-canvas parallel to the border extends along it —
+	# every candidate point is already outside the canvas, so this guard
+	# cannot tell that case from a genuine exit.
+	var p_ext = p + dir * reach
+	if _map_rect.has_point(p_ext):
+		return null
+	return p_ext
 
 func _is_closed(path) -> bool:
 	for prop in ["loop", "Loop", "closed", "Closed", "IsLoop"]:
@@ -412,7 +483,8 @@ func _path_strip_polygons(path, inset: float, cut_portals: bool = true, ring_out
 # should still let light through.
 func get_all_wall_portals(path, half: float = 64.0) -> Array:
 	var portals = path_tagging.get_wall_portals(path, false)
-	var pts = _world_points(path)
+	# DRAWN spine only: "Extend off map" must not widen the adoption zone.
+	var pts = _world_points(path, false)
 	if pts.size() >= 2:
 		for portal in path_tagging.get_unattached_portals():
 			var radius = portal.get("Radius")
@@ -836,8 +908,10 @@ func _contour_to_polygons(path, side: int) -> Array:
 			closed_poly.append(p)
 		return _pick_by_vote(path, closed_poly, _rect_minus(closed_poly), samples, "closed")
 
-	# Open contour: decide from the ORIGINAL endpoints whether the canvas cut
-	# this contour off, then hop perpendicular to the edge if so.
+	# Open contour: decide from the spine's endpoints — the drawn ones, or the
+	# "Extend off map" virtual ones, which classify as at-edge by design —
+	# whether the canvas cut this contour off, then hop perpendicular to the
+	# edge if so.
 	var edge_tol = float(sun_settings.get_sun().get("tier_px", 256.0)) * 1.5
 	var last = pts.size() - 1
 	var start_on_edge = _endpoint_at_edge(pts[0], edge_tol)

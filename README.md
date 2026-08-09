@@ -83,6 +83,12 @@ with a pattern tiled into it — crates, cages, grates.
   tacked onto it has no bumps at the junctions. Want a taller stretch? Draw a
   segment over it and give that segment the height you want. Ground still
   lifts what stands on it: a 10 ft wall on a 20 ft cliff is 30 ft.
+- **Extend off map.** Dungeondraft won't let you draw past the canvas, so a
+  wall running to the map edge used to end its shadow in a tell-tale rounded
+  cap. The per-path slider continues edge-touching ends off-screen — geometry
+  only, nothing visible — so the shadow runs clean off the border. If a faint
+  cut-off still shows with the sun blowing along the edge, raise the slider:
+  the artifact moves off-canvas by exactly the extension.
 - **Respects your layering.** A layer-4 path's shadow darkens layer-2 cliff art.
   Objects escape or receive a shadow with Dungeondraft's own **Bring to front /
   Send to back** — per object, saved with the map. Cliff art can hide the
@@ -145,6 +151,7 @@ Dungeondraft 1.2.0.1.
 | Drop height (ft) | How far the ground drops. Drives shadow length physically. Slider to 120 ft; type into the box for up to 240 ft. |
 | Art above shadow | The path's artwork draws over its own layer's shadow, so the texture's real edge hides where the shadow starts. On by default for casters. |
 | Shadow inset | Fine-tune (in px) how far the shadow tucks under the art's edge. |
+| Extend off map | Continue this path's edge-touching ends past the canvas (in grid squares), so shadows don't reveal where the map border forced the drawing to stop. |
 
 ### Per portal (door / window)
 
